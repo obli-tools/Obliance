@@ -1,0 +1,2440 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// ── Types ──────────────────────────────────────────────────────────────────────
+
+// CommandAck reports the outcome of an AgentCommand back to the server.
+// It is included in the next push request's acks[] field.
+type CommandAck struct {
+	CommandID   string      `json:"commandId"`
+	CommandType string      `json:"commandType,omitempty"`
+	Status      string      `json:"status"` // ack_running, success, failure, timeout
+	Result      interface{} `json:"result,omitempty"`
+}
+
+// CommandDispatcher receives AgentCommands, executes them in background
+// goroutines, and accumulates CommandAcks for the next push cycle.
+type CommandDispatcher struct {
+	// device ID: read through currentDeviceUUID() (device_identity.go)
+	apiKey                string
+	serverURL             string
+	remediationEnabled    bool
+	tlsInsecureSkipVerify bool
+	pendingAcks           []CommandAck
+	mu                    sync.Mutex
+}
+
+// NewCommandDispatcher creates a CommandDispatcher bound to the given device.
+func NewCommandDispatcher(apiKey, serverURL string, remediationEnabled, tlsInsecureSkipVerify bool) *CommandDispatcher {
+	return &CommandDispatcher{
+		apiKey:                apiKey,
+		serverURL:             serverURL,
+		remediationEnabled:    remediationEnabled,
+		tlsInsecureSkipVerify: tlsInsecureSkipVerify,
+	}
+}
+
+// SetRemediationEnabled updates the remediation flag (called on each push response).
+func (d *CommandDispatcher) SetRemediationEnabled(enabled bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.remediationEnabled = enabled
+}
+
+// GetAndClearAcks returns all pending acks and resets the internal list.
+// Thread-safe.
+func (d *CommandDispatcher) GetAndClearAcks() []CommandAck {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.pendingAcks) == 0 {
+		return nil
+	}
+	acks := make([]CommandAck, len(d.pendingAcks))
+	copy(acks, d.pendingAcks)
+	d.pendingAcks = d.pendingAcks[:0]
+	return acks
+}
+
+// requeueAcks puts back acks whose push did not reach the server (they go
+// out with the next push, before any newer ack). Thread-safe.
+func (d *CommandDispatcher) requeueAcks(acks []CommandAck) {
+	if len(acks) == 0 {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	merged := make([]CommandAck, 0, len(acks)+len(d.pendingAcks))
+	merged = append(merged, acks...)
+	merged = append(merged, d.pendingAcks...)
+	// Bounded: an agent cut off for days must not grow without limit.
+	if len(merged) > 500 {
+		merged = merged[len(merged)-500:]
+	}
+	d.pendingAcks = merged
+}
+
+// addAck appends an ack to the pending list. Thread-safe.
+func (d *CommandDispatcher) addAck(ack CommandAck) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.pendingAcks = append(d.pendingAcks, ack)
+}
+
+// ── Dispatch ──────────────────────────────────────────────────────────────────
+
+// HandleCommand starts a goroutine that executes cmd and accumulates acks.
+// Returns immediately (non-blocking).
+func (d *CommandDispatcher) HandleCommand(cmd AgentCommand) {
+	log.Printf("Command received: id=%s type=%s priority=%s", cmd.ID, cmd.Type, cmd.Priority)
+
+	// Immediately acknowledge that we are starting the work.
+	d.addAck(CommandAck{
+		CommandID:   cmd.ID,
+		CommandType: cmd.Type,
+		Status:      "ack_running",
+	})
+
+	go d.executeCommand(cmd)
+}
+
+// isBlockedByPrivacy returns true for command types that must be refused when
+// privacy mode is active.
+func isBlockedByPrivacy(cmdType string) bool {
+	switch cmdType {
+	case "open_remote_tunnel", "open_vm_console", "ssh_jump_grant", "run_script", "list_wts_sessions",
+		"list_processes", "kill_process",
+		"list_directory", "create_directory", "rename_file",
+		"delete_file", "download_file", "upload_file",
+		"start_usage_scan", "get_usage_children", "get_usage_top_files", "cancel_usage_scan":
+		return true
+	}
+	return false
+}
+
+// privacyFeatureForCommand maps a command type to the logical feature name
+// used for privacy-gate unlock tokens. Must stay in sync with the server-side
+// mapping.
+func privacyFeatureForCommand(cmdType string) string {
+	switch cmdType {
+	case "run_script":
+		return "scripts"
+	case "open_remote_tunnel", "open_vm_console", "ssh_jump_grant":
+		return "remote"
+	case "list_wts_sessions", "list_processes", "kill_process":
+		return "processes"
+	case "list_directory", "create_directory", "rename_file",
+		"delete_file", "download_file", "upload_file",
+		"start_usage_scan", "get_usage_children", "get_usage_top_files", "cancel_usage_scan":
+		return "files"
+	}
+	return ""
+}
+
+func (d *CommandDispatcher) executeCommand(cmd AgentCommand) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in command %s (%s): %v", cmd.ID, cmd.Type, r)
+			d.addAck(CommandAck{
+				CommandID:   cmd.ID,
+				CommandType: cmd.Type,
+				Status:      "failure",
+				Result:      map[string]string{"error": fmt.Sprintf("panic: %v", r)},
+			})
+		}
+	}()
+
+	var result interface{}
+	var execErr error
+
+	// Privacy mode: reject remote-access commands, unless EITHER a valid
+	// unlock token is provided for the requested feature OR the server
+	// flagged the command as an admin-authorized bypass (set by the
+	// scenario / schedule "bypass privacy mode" toggle, which is itself
+	// gated by the per-tenant action-restriction matrix server-side).
+	if IsPrivacyMode() && isBlockedByPrivacy(cmd.Type) {
+		bypass, _ := cmd.Payload["bypassPrivacy"].(bool)
+		token, _ := cmd.Payload["unlockToken"].(string)
+		feature := privacyFeatureForCommand(cmd.Type)
+		if !bypass && !CheckUnlockToken(token, feature) {
+			log.Printf("Command %s (%s) blocked by privacy mode", cmd.ID, cmd.Type)
+			d.addAck(CommandAck{
+				CommandID:   cmd.ID,
+				CommandType: cmd.Type,
+				Status:      "failure",
+				Result:      map[string]string{"error": "privacy mode is enabled — remote access denied"},
+			})
+			return
+		}
+		if bypass {
+			log.Printf("Command %s (%s) allowed via server-authorized privacy bypass", cmd.ID, cmd.Type)
+		} else {
+			log.Printf("Command %s (%s) allowed via privacy unlock token", cmd.ID, cmd.Type)
+		}
+	}
+
+	switch cmd.Type {
+	case "hyperv_list_vms":
+		result, execErr = d.handleHyperVListVMs(cmd)
+	case "hyperv_control":
+		result, execErr = d.handleHyperVControl(cmd)
+	case "hyperv_console_thumbnail":
+		result, execErr = d.handleHyperVConsoleThumbnail(cmd)
+	case "install_vm_console":
+		result, execErr = d.handleInstallVmConsole(cmd)
+	case "open_vm_console":
+		result, execErr = d.handleOpenVmConsole(cmd)
+	case "close_vm_console":
+		result, execErr = d.handleCloseVmConsole(cmd)
+	case "veeam_list_jobs":
+		result, execErr = d.handleVeeamListJobs(cmd)
+	case "veeam_control":
+		result, execErr = d.handleVeeamControl(cmd)
+
+	case "scan_inventory":
+		result, execErr = d.handleScanInventory(cmd)
+
+	case "scan_updates":
+		result, execErr = d.handleScanUpdates(cmd)
+
+	case "run_script":
+		result, execErr = d.handleRunScript(cmd)
+
+	case "cancel_script":
+		result, execErr = d.handleCancelScript(cmd)
+
+	case "install_update":
+		result, execErr = d.handleInstallUpdate(cmd)
+
+	case "install_updates":
+		result, execErr = d.handleInstallUpdates(cmd)
+
+	case "check_compliance":
+		result, execErr = d.handleCheckCompliance(cmd)
+
+	case "remediate_rule":
+		result, execErr = d.handleRemediateRule(cmd)
+
+	case "open_remote_tunnel":
+		result, execErr = d.handleOpenRemoteTunnel(cmd)
+
+	case "close_remote_tunnel":
+		result, execErr = d.handleCloseRemoteTunnel(cmd)
+
+	case "ssh_jump_grant":
+		result, execErr = d.handleSshJumpGrant(cmd)
+
+	case "ssh_jump_revoke":
+		result, execErr = d.handleSshJumpRevoke(cmd)
+
+	case "reboot":
+		execErr = d.handleReboot(cmd)
+
+	case "shutdown":
+		execErr = d.handleShutdown(cmd)
+
+	case "sleep":
+		execErr = d.handleSleep(cmd)
+
+	case "start_custom_section":
+		result, execErr = d.handleStartCustomSection(cmd)
+	case "stop_custom_section":
+		execErr = d.handleStopCustomSection(cmd)
+	case "resize_custom_section":
+		execErr = d.handleResizeCustomSection(cmd)
+
+	case "set_privacy_password":
+		result, execErr = d.handleSetPrivacyPassword(cmd)
+		d.redactPayloadPassword(&cmd)
+	case "change_privacy_password":
+		result, execErr = d.handleChangePrivacyPassword(cmd)
+		d.redactPayloadPassword(&cmd)
+	case "remove_privacy_password":
+		result, execErr = d.handleRemovePrivacyPassword(cmd)
+		d.redactPayloadPassword(&cmd)
+	case "verify_privacy_password":
+		result, execErr = d.handleVerifyPrivacyPassword(cmd)
+		d.redactPayloadPassword(&cmd)
+
+	case "restart_agent":
+		execErr = d.handleRestartAgent(cmd)
+
+	case "update_agent":
+		execErr = d.handleUpdateAgent(cmd)
+
+	case "uninstall_agent":
+		execErr = d.handleUninstallAgent()
+
+	case "install_oblireach":
+		result, execErr = d.handleInstallOblireach(cmd)
+
+	case "list_wts_sessions":
+		result, execErr = d.handleListWtsSessions(cmd)
+
+	case "list_processes":
+		result, execErr = d.handleListProcesses(cmd)
+
+	case "kill_process":
+		result, execErr = d.handleKillProcess(cmd)
+
+	case "list_services":
+		result, execErr = d.handleListServices(cmd)
+
+	case "restart_service":
+		result, execErr = d.handleRestartService(cmd)
+		if execErr == nil {
+			go d.collectAndPostServices()
+		}
+
+	case "start_service":
+		result, execErr = d.handleStartService(cmd)
+		if execErr == nil {
+			go d.collectAndPostServices()
+		}
+
+	case "stop_service":
+		result, execErr = d.handleStopService(cmd)
+		if execErr == nil {
+			go d.collectAndPostServices()
+		}
+
+	case "set_service_start_type":
+		result, execErr = d.handleSetServiceStartType(cmd)
+		if execErr == nil {
+			go d.collectAndPostServices()
+		}
+
+	case "list_directory":
+		result, execErr = d.handleListDirectory(cmd)
+	case "create_directory":
+		result, execErr = d.handleCreateDirectory(cmd)
+	case "rename_file":
+		result, execErr = d.handleRenameFile(cmd)
+	case "delete_file":
+		result, execErr = d.handleDeleteFile(cmd)
+	case "download_file":
+		result, execErr = d.handleDownloadFile(cmd)
+	case "upload_file":
+		result, execErr = d.handleUploadFile(cmd)
+	case "start_usage_scan":
+		result, execErr = d.handleStartUsageScan(cmd)
+	case "get_usage_children":
+		result, execErr = d.handleGetUsageChildren(cmd)
+	case "get_usage_top_files":
+		result, execErr = d.handleGetUsageTopFiles(cmd)
+	case "cancel_usage_scan":
+		result, execErr = d.handleCancelUsageScan(cmd)
+
+	case "scan_network":
+		result, execErr = d.handleScanNetwork(cmd)
+
+	case "check_software_compliance":
+		result, execErr = d.handleCheckSoftwareCompliance(cmd)
+	case "install_software":
+		result, execErr = d.handleInstallSoftware(cmd)
+	case "uninstall_software":
+		result, execErr = d.handleUninstallSoftware(cmd)
+
+	case "disable_privacy_mode":
+		if err := SetPrivacyMode(false, "remote"); err != nil {
+			execErr = err
+		} else {
+			result = map[string]string{"message": "privacy mode disabled"}
+		}
+
+	case "enable_privacy_mode":
+		if err := SetPrivacyMode(true, "remote"); err != nil {
+			execErr = err
+		} else {
+			result = map[string]string{"message": "privacy mode enabled"}
+		}
+
+	case "live_metrics":
+		// Two modes:
+		//   - push_now: trigger one immediate metrics push. Used by
+		//     the manual refresh button on the device detail page.
+		//   - live    : enter fast-push mode (3s cadence) for the
+		//     window passed in payload.windowSec. Reverts to the
+		//     configured push_interval when the window expires.
+		mode, _ := cmd.Payload["mode"].(string)
+		if mode == "live" {
+			windowSec := 60.0
+			if w, ok := cmd.Payload["windowSec"].(float64); ok && w > 0 {
+				windowSec = w
+			}
+			TriggerLiveMetrics(int(windowSec))
+		} else {
+			TriggerImmediatePush()
+		}
+		result = map[string]string{"message": "live metrics ack"}
+
+	case "enable_airgap":
+		serverIPs, _ := cmd.Payload["serverIPs"].([]interface{})
+		ips := make([]string, 0, len(serverIPs))
+		for _, v := range serverIPs {
+			if s, ok := v.(string); ok {
+				ips = append(ips, s)
+			}
+		}
+		execErr = SetAirgapMode(true, "remote", ips)
+		if execErr == nil {
+			result = map[string]string{"message": "airgap enabled"}
+		}
+	case "disable_airgap":
+		execErr = SetAirgapMode(false, "remote", nil)
+		if execErr == nil {
+			result = map[string]string{"message": "airgap disabled"}
+		}
+
+	default:
+		execErr = fmt.Errorf("unknown command type: %s", cmd.Type)
+	}
+
+	ack := CommandAck{CommandID: cmd.ID, CommandType: cmd.Type}
+	if execErr != nil {
+		log.Printf("Command %s (%s) failed: %v", cmd.ID, cmd.Type, execErr)
+		ack.Status = "failure"
+		ack.Result = map[string]string{"error": execErr.Error()}
+	} else {
+		ack.Result = result
+		// For run_script: compare actual exit code against expectedExitCode from payload.
+		// A mismatch means the script did not exit as expected → mark as failure but
+		// still include the full ScriptResult so stdout/stderr are accessible.
+		if cmd.Type == "run_script" {
+			if sr, ok := result.(*ScriptResult); ok {
+				expectedCode := 0
+				if cmd.Payload != nil {
+					if v, ok2 := cmd.Payload["expectedExitCode"].(float64); ok2 {
+						expectedCode = int(v)
+					}
+				}
+				if sr.ExitCode != expectedCode {
+					log.Printf("Command %s (run_script) exit code mismatch: got %d, expected %d", cmd.ID, sr.ExitCode, expectedCode)
+					ack.Status = "failure"
+				} else {
+					log.Printf("Command %s (%s) completed successfully (exit code %d)", cmd.ID, cmd.Type, sr.ExitCode)
+					ack.Status = "success"
+				}
+			} else {
+				log.Printf("Command %s (%s) completed successfully", cmd.ID, cmd.Type)
+				ack.Status = "success"
+			}
+		} else {
+			log.Printf("Command %s (%s) completed successfully", cmd.ID, cmd.Type)
+			ack.Status = "success"
+		}
+	}
+	d.addAck(ack)
+	// Deliver the outcome now instead of at the next regular push (which can
+	// be minutes away): a task used to stay "Sent" in the Tasks tab — and
+	// time out server-side — although the agent had long finished it.
+	TriggerImmediatePush()
+}
+
+// ── Command handlers ──────────────────────────────────────────────────────────
+
+func (d *CommandDispatcher) handleScanInventory(cmd AgentCommand) (interface{}, error) {
+	cfg := d.makeConfig()
+	inv, err := ScanInventory()
+	if err != nil {
+		// Non-fatal: post what we have.
+		log.Printf("Command %s: inventory scan partial error: %v", cmd.ID, err)
+	}
+	if inv == nil {
+		return nil, fmt.Errorf("inventory scan returned no data")
+	}
+	if postErr := PostInventory(inv, cfg); postErr != nil {
+		return nil, fmt.Errorf("post inventory: %w", postErr)
+	}
+	// Refresh the Hyper-V VM list on the inventory cadence — best-effort,
+	// never fails the inventory scan. No-op on non-hosts.
+	if detectVirtualizationHost() != "" {
+		if err := postHyperVVMs(cfg); err != nil {
+			log.Printf("Command %s: hyper-v VM refresh failed: %v", cmd.ID, err)
+		}
+	}
+	// Same for the Veeam job list. No-op on non-backup-hosts.
+	if detectBackupHost() != "" {
+		if err := postVeeamJobs(cfg); err != nil {
+			log.Printf("Command %s: veeam job refresh failed: %v", cmd.ID, err)
+		}
+	}
+	return map[string]interface{}{
+		"softwareCount": len(inv.Software),
+		"diskCount":     len(inv.Disks),
+	}, nil
+}
+
+// handleHyperVListVMs enumerates VMs and posts them to the server on demand
+// (triggered by the UI "refresh" button). No-op + clear error on non-hosts.
+func (d *CommandDispatcher) handleHyperVListVMs(cmd AgentCommand) (interface{}, error) {
+	if detectVirtualizationHost() == "" {
+		return nil, fmt.Errorf("this host is not a Hyper-V host")
+	}
+	cfg := d.makeConfig()
+	if err := postHyperVVMs(cfg); err != nil {
+		return nil, fmt.Errorf("post hyper-v VMs: %w", err)
+	}
+	return map[string]interface{}{"status": "refreshed"}, nil
+}
+
+// handleHyperVControl performs a power/checkpoint/edit/create/delete action on
+// a VM. The server has already gated the action by capability + restriction;
+// the agent just executes it. After the action we re-post the VM list so the
+// UI reflects the new state quickly.
+func (d *CommandDispatcher) handleHyperVControl(cmd AgentCommand) (interface{}, error) {
+	if detectVirtualizationHost() == "" {
+		return nil, fmt.Errorf("this host is not a Hyper-V host")
+	}
+	action, _ := cmd.Payload["action"].(string)
+	vmID, _ := cmd.Payload["vmId"].(string)
+	params, _ := cmd.Payload["params"].(map[string]interface{})
+	if action == "" {
+		return nil, fmt.Errorf("hyperv_control: missing action")
+	}
+	if vmID == "" && action != "create" {
+		return nil, fmt.Errorf("hyperv_control: missing vmId")
+	}
+	msg, err := runHyperVControl(action, vmID, params)
+	if err != nil {
+		return nil, err
+	}
+	// Re-post the VM list now AND a few more times as the VM settles. Power
+	// verbs (Start-VM/Stop-VM/…) return while the VM is still transitioning,
+	// so an immediate post captures "Starting", not "Running". The staggered
+	// reposts (+4s/+10s/+20s) let the final steady state land within ~20s
+	// without the operator hitting Refresh. Detached goroutine so the
+	// command ack returns immediately.
+	cfg := d.makeConfig()
+	if perr := postHyperVVMs(cfg); perr != nil {
+		log.Printf("Command %s: post-action VM refresh failed: %v", cmd.ID, perr)
+	}
+	go func() {
+		for _, delay := range []time.Duration{4 * time.Second, 10 * time.Second, 20 * time.Second} {
+			time.Sleep(delay)
+			if perr := postHyperVVMs(cfg); perr != nil {
+				log.Printf("hyper-v settle repost failed: %v", perr)
+				return
+			}
+		}
+	}()
+	return map[string]interface{}{"message": msg}, nil
+}
+
+// handleHyperVConsoleThumbnail captures a VM console framebuffer and posts it
+// to the server, which relays it to open console previews/viewers. Pushed
+// ephemerally (no history). width/height optional (default 640x480).
+func (d *CommandDispatcher) handleHyperVConsoleThumbnail(cmd AgentCommand) (interface{}, error) {
+	if detectVirtualizationHost() == "" {
+		return nil, fmt.Errorf("this host is not a Hyper-V host")
+	}
+	vmID, _ := cmd.Payload["vmId"].(string)
+	if vmID == "" {
+		return nil, fmt.Errorf("hyperv_console_thumbnail: missing vmId")
+	}
+	w, h := 640, 480
+	if v, ok := cmd.Payload["width"].(float64); ok && v > 0 {
+		w = int(v)
+	}
+	if v, ok := cmd.Payload["height"].(float64); ok && v > 0 {
+		h = int(v)
+	}
+	cfg := d.makeConfig()
+	if err := postHyperVThumbnail(cfg, vmID, w, h); err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{"status": "captured"}, nil
+}
+
+// handleVeeamListJobs enumerates Veeam jobs and posts them to the server on
+// demand (UI "refresh" button). No-op + clear error on non-backup-hosts.
+func (d *CommandDispatcher) handleVeeamListJobs(cmd AgentCommand) (interface{}, error) {
+	if detectBackupHost() == "" {
+		return nil, fmt.Errorf("this host is not a Veeam B&R server")
+	}
+	cfg := d.makeConfig()
+	if err := postVeeamJobs(cfg); err != nil {
+		return nil, fmt.Errorf("post veeam jobs: %w", err)
+	}
+	return map[string]interface{}{"status": "refreshed"}, nil
+}
+
+// handleVeeamControl runs a start/stop/retry/enable/disable action on a job.
+// The server has already gated the action by capability + restriction; the
+// agent just executes it. After the action we re-post the job list (plus a
+// few staggered reposts) so the UI reflects the new state quickly — Start/Stop
+// return while the session is still transitioning.
+func (d *CommandDispatcher) handleVeeamControl(cmd AgentCommand) (interface{}, error) {
+	if detectBackupHost() == "" {
+		return nil, fmt.Errorf("this host is not a Veeam B&R server")
+	}
+	action, _ := cmd.Payload["action"].(string)
+	jobID, _ := cmd.Payload["jobId"].(string)
+	if action == "" {
+		return nil, fmt.Errorf("veeam_control: missing action")
+	}
+	if jobID == "" {
+		return nil, fmt.Errorf("veeam_control: missing jobId")
+	}
+	msg, err := runVeeamControl(action, jobID)
+	if err != nil {
+		return nil, err
+	}
+	cfg := d.makeConfig()
+	if perr := postVeeamJobs(cfg); perr != nil {
+		log.Printf("Command %s: post-action job refresh failed: %v", cmd.ID, perr)
+	}
+	go func() {
+		for _, delay := range []time.Duration{5 * time.Second, 15 * time.Second, 30 * time.Second} {
+			time.Sleep(delay)
+			if perr := postVeeamJobs(cfg); perr != nil {
+				log.Printf("veeam settle repost failed: %v", perr)
+				return
+			}
+		}
+	}()
+	return map[string]interface{}{"message": msg}, nil
+}
+
+func (d *CommandDispatcher) handleScanUpdates(cmd AgentCommand) (interface{}, error) {
+	cfg := d.makeConfig()
+	updates, rebootPending, err := ScanUpdates()
+	if err != nil {
+		return nil, fmt.Errorf("scan updates: %w", err)
+	}
+	if postErr := PostUpdates(updates, rebootPending, cfg); postErr != nil {
+		return nil, fmt.Errorf("post updates: %w", postErr)
+	}
+	return map[string]interface{}{
+		"updateCount":   len(updates),
+		"rebootPending": rebootPending,
+	}, nil
+}
+
+func (d *CommandDispatcher) handleCancelScript(cmd AgentCommand) (interface{}, error) {
+	payload := cmd.Payload
+	if payload == nil {
+		return nil, fmt.Errorf("cancel_script: missing payload")
+	}
+	targetCmdID, ok := payload["commandQueueId"].(string)
+	if !ok || targetCmdID == "" {
+		return nil, fmt.Errorf("cancel_script: commandQueueId not specified")
+	}
+	if CancelRunningScript(targetCmdID) {
+		return map[string]string{"status": "cancelled", "commandQueueId": targetCmdID}, nil
+	}
+	return map[string]string{"status": "not_found", "commandQueueId": targetCmdID}, nil
+}
+
+func (d *CommandDispatcher) handleRunScript(cmd AgentCommand) (interface{}, error) {
+	// Extract script parameters from the command payload.
+	payload := cmd.Payload
+	if payload == nil {
+		return nil, fmt.Errorf("run_script: missing payload")
+	}
+
+	sc := ScriptCommand{
+		ID:         cmd.ID,
+		Parameters: make(map[string]any),
+	}
+
+	if v, ok := payload["runtime"].(string); ok {
+		sc.Runtime = v
+	}
+	if v, ok := payload["content"].(string); ok {
+		sc.Content = v
+	}
+	if v, ok := payload["runAs"].(string); ok {
+		sc.RunAs = v
+	}
+	if v, ok := payload["timeoutSeconds"].(float64); ok {
+		sc.TimeoutSeconds = int(v)
+	}
+	if params, ok := payload["parameters"].(map[string]interface{}); ok {
+		for k, val := range params {
+			sc.Parameters[k] = val
+		}
+	}
+	// script_params.go: secret names (never substituted / positional) and
+	// the definition order (positional arguments).
+	sc.SecretNames = payloadStringList(payload["secretParameterNames"])
+	sc.ParamOrder = payloadStringList(payload["parameterOrder"])
+
+	if sc.Runtime == "" {
+		return nil, fmt.Errorf("run_script: runtime not specified")
+	}
+	if sc.Content == "" {
+		return nil, fmt.Errorf("run_script: content not specified")
+	}
+
+	scriptResult, err := ExecuteScript(sc)
+	if err != nil {
+		return nil, fmt.Errorf("execute script: %w", err)
+	}
+	return scriptResult, nil
+}
+
+func (d *CommandDispatcher) handleInstallUpdate(cmd AgentCommand) (interface{}, error) {
+	payload := cmd.Payload
+	if payload == nil {
+		return nil, fmt.Errorf("install_update: missing payload")
+	}
+	uid, ok := payload["updateUid"].(string)
+	if !ok || uid == "" {
+		return nil, fmt.Errorf("install_update: updateUid not specified")
+	}
+	source := payloadString(payload, "source")
+	if err := InstallUpdate(uid, source); err != nil {
+		return nil, err
+	}
+	return map[string]string{"updateUid": uid, "message": "installed successfully"}, nil
+}
+
+func (d *CommandDispatcher) handleInstallUpdates(cmd AgentCommand) (interface{}, error) {
+	payload := cmd.Payload
+	if payload == nil {
+		return nil, fmt.Errorf("install_updates: missing payload")
+	}
+	source := payloadString(payload, "source")
+
+	// Extract updateUids array
+	rawUids, ok := payload["updateUids"].([]interface{})
+	if !ok || len(rawUids) == 0 {
+		return nil, fmt.Errorf("install_updates: updateUids array required")
+	}
+	var uids []string
+	for _, raw := range rawUids {
+		if s, ok := raw.(string); ok && s != "" {
+			uids = append(uids, s)
+		}
+	}
+	if len(uids) == 0 {
+		return nil, fmt.Errorf("install_updates: no valid uids")
+	}
+
+	if err := InstallUpdatesBatch(uids, source); err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{"updateUids": uids, "count": len(uids), "message": "batch install completed"}, nil
+}
+
+// ── Compliance Rule Evaluation Engine ────────────────────────────────────────
+
+// ComplianceRule mirrors the shared ComplianceRule TypeScript type.
+type ComplianceRule struct {
+	ID                    string      `json:"id"`
+	Name                  string      `json:"name"`
+	Category              string      `json:"category"`
+	CheckType             string      `json:"checkType"`      // registry|file|command|service|event_log|process|policy
+	TargetPlatform        string      `json:"targetPlatform"` // windows|macos|linux|all
+	Target                string      `json:"target"`
+	Expected              interface{} `json:"expected"`
+	Operator              string      `json:"operator"` // eq|neq|gt|lt|contains|not_contains|exists|not_exists|regex
+	Severity              string      `json:"severity"`
+	AutoRemediateScriptId interface{} `json:"autoRemediateScriptId"`
+	RemediationScript     string      `json:"remediationScript,omitempty"`
+}
+
+// ComplianceRuleResult mirrors the shared ComplianceRuleResult TypeScript type.
+type ComplianceRuleResult struct {
+	RuleID               string      `json:"ruleId"`
+	Status               string      `json:"status"` // pass|fail|warning|error|skipped|unknown
+	ActualValue          interface{} `json:"actualValue,omitempty"`
+	CheckedAt            string      `json:"checkedAt"`
+	RemediationTriggered bool        `json:"remediationTriggered"`
+}
+
+// handleCheckCompliance evaluates each rule in the policy payload and posts
+// results to the server via POST /api/agent/compliance.
+func (d *CommandDispatcher) handleCheckCompliance(cmd AgentCommand) (interface{}, error) {
+	// Parse rules from payload
+	var rules []ComplianceRule
+	if cmd.Payload != nil {
+		if rulesRaw, ok := cmd.Payload["rules"]; ok {
+			rawBytes, err := json.Marshal(rulesRaw)
+			if err == nil {
+				_ = json.Unmarshal(rawBytes, &rules)
+			}
+		}
+	}
+
+	policyId := interface{}(nil)
+	if cmd.Payload != nil {
+		policyId = cmd.Payload["policyId"]
+	}
+
+	// Read remediation flag from dispatcher (set from last push response).
+	d.mu.Lock()
+	remediationEnabled := d.remediationEnabled
+	d.mu.Unlock()
+
+	// Detect third-party AV/firewall (Windows only) — auto-pass Defender/firewall-logging rules
+	thirdPartyAV, thirdPartyFW := detectThirdPartySecurity()
+	if thirdPartyAV != "" {
+		log.Printf("Compliance: third-party AV detected: %s — Defender rules auto-pass", thirdPartyAV)
+	}
+	if thirdPartyFW != "" {
+		log.Printf("Compliance: third-party firewall detected: %s", thirdPartyFW)
+	}
+
+	// Evaluate each rule
+	results := make([]ComplianceRuleResult, 0, len(rules))
+	for _, rule := range rules {
+		// Auto-pass Defender rules when a third-party AV is active
+		if thirdPartyAV != "" && isDefenderRule(rule) {
+			results = append(results, ComplianceRuleResult{
+				RuleID:      rule.ID,
+				Status:      "pass",
+				ActualValue: fmt.Sprintf("Third-party AV: %s", thirdPartyAV),
+				CheckedAt:   time.Now().UTC().Format(time.RFC3339),
+			})
+			continue
+		}
+		r := evaluateComplianceRule(rule)
+		// Auto-remediate failing rules when enabled and a script is configured.
+		if remediationEnabled && r.Status == "fail" && rule.AutoRemediateScriptId != nil {
+			scriptId := fmt.Sprintf("%v", rule.AutoRemediateScriptId)
+			if scriptId != "" && scriptId != "<nil>" && scriptId != "0" {
+				log.Printf("Compliance: auto-remediating rule %s with script %s", rule.ID, scriptId)
+				if err := d.runRemediationScript(scriptId); err != nil {
+					log.Printf("Compliance: remediation script %s failed: %v", scriptId, err)
+				} else {
+					r.RemediationTriggered = true
+				}
+			}
+		}
+		results = append(results, r)
+	}
+
+	// If no rules, fall back to legacy firewall check
+	if len(rules) == 0 {
+		fw := checkFirewallStatus()
+		fwStatus := "unknown"
+		if strings.Contains(fw, "active") || strings.Contains(fw, "profiles_enabled:3") || strings.Contains(fw, "State is enabled") {
+			fwStatus = "pass"
+		} else if fw != "unknown" {
+			fwStatus = "fail"
+		}
+		results = append(results, ComplianceRuleResult{
+			RuleID:      "firewall",
+			Status:      fwStatus,
+			ActualValue: fw,
+			CheckedAt:   time.Now().UTC().Format(time.RFC3339),
+		})
+	}
+
+	// Compute score
+	passed := 0
+	evaluated := 0
+	for _, r := range results {
+		if r.Status == "skipped" || r.Status == "unknown" {
+			continue
+		}
+		evaluated++
+		if r.Status == "pass" {
+			passed++
+		}
+	}
+	score := 0.0
+	if evaluated > 0 {
+		score = float64(passed) / float64(evaluated) * 100.0
+	}
+
+	// Post results to server asynchronously
+	go d.postComplianceResults(policyId, results, score)
+
+	return map[string]interface{}{
+		"policyId": policyId,
+		"score":    score,
+		"passed":   passed,
+		"failed":   evaluated - passed,
+		"total":    len(results),
+		"platform": runtime.GOOS,
+	}, nil
+}
+
+// handleRemediateRule executes an inline remediation script for a single compliance rule.
+func (d *CommandDispatcher) handleRemediateRule(cmd AgentCommand) (interface{}, error) {
+	if cmd.Payload == nil {
+		return nil, fmt.Errorf("no payload")
+	}
+	script, _ := cmd.Payload["script"].(string)
+	if script == "" {
+		return nil, fmt.Errorf("empty remediation script")
+	}
+	ruleId, _ := cmd.Payload["ruleId"].(string)
+	runtimeStr, _ := cmd.Payload["runtime"].(string)
+	if runtimeStr == "" {
+		if runtime.GOOS == "windows" {
+			runtimeStr = "powershell"
+		} else {
+			runtimeStr = "bash"
+		}
+	}
+
+	log.Printf("Compliance: remediating rule %s with inline script (%s)", ruleId, runtimeStr)
+
+	result, err := ExecuteScript(ScriptCommand{
+		ID:             "remediate-" + ruleId,
+		Runtime:        runtimeStr,
+		Content:        script,
+		TimeoutSeconds: 120,
+	})
+	if err != nil {
+		return map[string]interface{}{
+			"ruleId":  ruleId,
+			"success": false,
+			"error":   err.Error(),
+		}, err
+	}
+
+	return map[string]interface{}{
+		"ruleId":   ruleId,
+		"success":  result.ExitCode == 0,
+		"exitCode": result.ExitCode,
+		"stdout":   result.Stdout,
+		"stderr":   result.Stderr,
+	}, nil
+}
+
+// detectThirdPartySecurity checks for third-party AV and firewall products via WMI SecurityCenter2.
+// Returns (avName, fwName) — empty strings if only Windows Defender / Windows Firewall are found.
+// One PowerShell spawn, Get-WmiObject (PowerShell 2.0 → 5.1; Get-CimInstance
+// needs PowerShell 3+). SecurityCenter2 exists on client Windows (Vista SP1+),
+// not on Windows Server: nothing is reported there, as before.
+func detectThirdPartySecurity() (string, string) {
+	if runtime.GOOS != "windows" {
+		return "", ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	out, err := runPSContext(ctx, securityCenterScript)
+	if err != nil && len(out) == 0 {
+		return "", ""
+	}
+	return parseSecurityCenterOutput(string(out))
+}
+
+// isDefenderRule returns true if the compliance rule is checking Windows Defender functionality.
+// Detects by rule ID prefix (wsb-011..wsb-025 = Defender section in baseline) or category/name keywords.
+func isDefenderRule(rule ComplianceRule) bool {
+	name := strings.ToLower(rule.Name)
+	cat := strings.ToLower(rule.Category)
+	target := strings.ToLower(rule.Target)
+	if strings.Contains(name, "defender") || strings.Contains(cat, "defender") || strings.Contains(cat, "antivirus") {
+		return true
+	}
+	if strings.Contains(target, "get-mpcomputerstatus") || strings.Contains(target, "set-mppreference") ||
+		strings.Contains(target, "windows defender") || strings.Contains(target, "microsoft\\windows defender") {
+		return true
+	}
+	return false
+}
+
+// evaluateComplianceRule evaluates a single rule and returns its result.
+func evaluateComplianceRule(rule ComplianceRule) ComplianceRuleResult {
+	now := time.Now().UTC().Format(time.RFC3339)
+	r := ComplianceRuleResult{RuleID: rule.ID, CheckedAt: now}
+
+	// Skip rules for other platforms
+	if rule.TargetPlatform != "all" && rule.TargetPlatform != runtime.GOOS &&
+		!(rule.TargetPlatform == "macos" && runtime.GOOS == "darwin") {
+		r.Status = "skipped"
+		return r
+	}
+	// darwin is reported as "macos" externally, normalise
+	gos := runtime.GOOS
+	if gos == "darwin" {
+		gos = "macos"
+	}
+	if rule.TargetPlatform == "macos" && gos != "macos" {
+		r.Status = "skipped"
+		return r
+	}
+
+	switch rule.CheckType {
+	case "registry":
+		r = evalRegistry(rule, r)
+	case "file":
+		r = evalFile(rule, r)
+	case "command":
+		r = evalCommand(rule, r)
+	case "service":
+		r = evalService(rule, r)
+	case "process":
+		r = evalProcess(rule, r)
+	case "event_log":
+		r = evalEventLog(rule, r)
+	default:
+		r.Status = "unknown"
+	}
+	return r
+}
+
+// ── Registry (Windows only) ───────────────────────────────────────────────────
+
+func evalRegistry(rule ComplianceRule, r ComplianceRuleResult) ComplianceRuleResult {
+	if runtime.GOOS != "windows" {
+		r.Status = "skipped"
+		return r
+	}
+	// target format: "HKLM\KEY\PATH|ValueName"
+	parts := strings.SplitN(rule.Target, "|", 2)
+	if len(parts) != 2 {
+		r.Status = "error"
+		r.ActualValue = "invalid target format — expected HKLM\\KEY\\PATH|ValueName"
+		return r
+	}
+	keyPath, valueName := parts[0], parts[1]
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	out, err := newCmdContext(ctx, "reg", "query", keyPath, "/v", valueName).Output()
+	if err != nil {
+		if rule.Operator == "not_exists" {
+			r.Status = "pass"
+			r.ActualValue = nil
+		} else if rule.Operator == "exists" {
+			r.Status = "fail"
+			r.ActualValue = "(absent)"
+		} else {
+			r.Status = "fail"
+			r.ActualValue = "(absent)"
+		}
+		return r
+	}
+
+	actual := parseRegValue(string(out))
+	r.ActualValue = actual
+	if rule.Operator == "exists" {
+		r.Status = "pass"
+		return r
+	}
+	if rule.Operator == "not_exists" {
+		r.Status = "fail"
+		return r
+	}
+	r.Status = evalOperator(actual, fmt.Sprintf("%v", rule.Expected), rule.Operator)
+	return r
+}
+
+// parseRegValue extracts the data value from `reg query` output.
+// Example line: "    SMB1    REG_DWORD    0x0"
+func parseRegValue(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "HKEY") || strings.HasPrefix(line, "Error") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 3 {
+			val := fields[len(fields)-1]
+			// Convert hex (REG_DWORD) to decimal
+			if strings.HasPrefix(strings.ToLower(val), "0x") {
+				if n, err := strconv.ParseInt(val[2:], 16, 64); err == nil {
+					return strconv.FormatInt(n, 10)
+				}
+			}
+			return val
+		}
+	}
+	return ""
+}
+
+// ── File ─────────────────────────────────────────────────────────────────────
+
+func evalFile(rule ComplianceRule, r ComplianceRuleResult) ComplianceRuleResult {
+	_, statErr := os.Stat(rule.Target)
+	exists := statErr == nil
+
+	if rule.Operator == "exists" {
+		r.Status = boolStatus(exists)
+		return r
+	}
+	if rule.Operator == "not_exists" {
+		r.Status = boolStatus(!exists)
+		return r
+	}
+
+	if !exists {
+		r.Status = "fail"
+		r.ActualValue = "file not found"
+		return r
+	}
+
+	content, err := os.ReadFile(rule.Target)
+	if err != nil {
+		r.Status = "error"
+		r.ActualValue = err.Error()
+		return r
+	}
+
+	actual := string(content)
+	expected := fmt.Sprintf("%v", rule.Expected)
+	r.Status = evalOperator(actual, expected, rule.Operator)
+	// Don't expose full file content — just show relevant snippet
+	if rule.Operator == "contains" || rule.Operator == "not_contains" {
+		if r.Status == "fail" {
+			r.ActualValue = "pattern not found"
+		} else {
+			r.ActualValue = "pattern found"
+		}
+	}
+	return r
+}
+
+// ── Command ──────────────────────────────────────────────────────────────────
+
+func evalCommand(rule ComplianceRule, r ComplianceRuleResult) ComplianceRuleResult {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = newCmdContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", psUTF8Prefix+rule.Target)
+	} else {
+		cmd = newCmdContext(ctx, "sh", "-c", rule.Target)
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		// Exit code != 0 is not necessarily an error for our purposes
+		// If we still got output, try to evaluate it
+		if len(out) == 0 {
+			r.Status = "error"
+			r.ActualValue = err.Error()
+			return r
+		}
+	}
+
+	actual := strings.TrimSpace(string(out))
+	expected := fmt.Sprintf("%v", rule.Expected)
+	r.ActualValue = actual
+	r.Status = evalOperator(actual, expected, rule.Operator)
+	return r
+}
+
+// ── Service ───────────────────────────────────────────────────────────────────
+
+func evalService(rule ComplianceRule, r ComplianceRuleResult) ComplianceRuleResult {
+	var actualStatus string
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	switch runtime.GOOS {
+	case "windows":
+		// Return both StartType and Status so rules can match either:
+		// "Disabled", "Manual", "Automatic" (StartType) or "Running", "Stopped" (Status)
+		// Exact names are read natively from the SCM (same Get-Service enum
+		// names; Get-Service has no StartType before PowerShell 5, i.e. on
+		// Windows 7 / 8.1 / 2008 R2 / 2012 / 2012 R2); wildcard targets keep
+		// the Get-Service path.
+		var out []byte
+		var err error
+		if !strings.ContainsAny(rule.Target, "*?[") {
+			st, status, found, nerr := serviceStartTypeAndStatus(rule.Target)
+			switch {
+			case nerr != nil:
+				err = nerr
+			case !found:
+				out = []byte("not_found")
+			default:
+				out = []byte(st + "|" + status)
+			}
+		} else {
+			out, err = runPSContext(ctx,
+				fmt.Sprintf(`$s=Get-Service -Name '%s' -ErrorAction SilentlyContinue | Select-Object -First 1; if($s){"$($s.StartType)|$($s.Status)"}else{'not_found'}`, rule.Target),
+			)
+		}
+		if err != nil || strings.TrimSpace(string(out)) == "" {
+			actualStatus = "not_found"
+		} else {
+			raw := strings.TrimSpace(string(out))
+			if raw == "not_found" {
+				actualStatus = "not_found"
+			} else {
+				// Format: "Disabled|Stopped" or "Automatic|Running"
+				parts := strings.SplitN(raw, "|", 2)
+				startType := parts[0]
+				status := ""
+				if len(parts) > 1 {
+					status = parts[1]
+				}
+				// Match against expected: if expected is a StartType keyword, use StartType; otherwise use Status
+				exp := strings.TrimSpace(fmt.Sprintf("%v", rule.Expected))
+				switch exp {
+				case "Disabled", "Manual", "Automatic":
+					actualStatus = startType
+				case "Running", "Stopped":
+					actualStatus = status
+				default:
+					// Default to StartType for backward compat
+					actualStatus = startType
+				}
+			}
+		}
+	case "linux":
+		out, _ := newCmdContext(ctx, "systemctl", "is-active", rule.Target).Output()
+		actualStatus = strings.TrimSpace(string(out))
+	case "freebsd":
+		out, err := newCmdContext(ctx, "service", rule.Target, "status").CombinedOutput()
+		if err != nil {
+			actualStatus = "stopped"
+		} else {
+			s := strings.ToLower(string(out))
+			if strings.Contains(s, "is running") {
+				actualStatus = "running"
+			} else if strings.Contains(s, "is not running") {
+				actualStatus = "stopped"
+			} else {
+				actualStatus = "stopped"
+			}
+		}
+	default: // macos / darwin
+		out, err := newCmdContext(ctx, "launchctl", "print", rule.Target).Output()
+		if err != nil {
+			actualStatus = "not_found"
+		} else if strings.Contains(string(out), "state = running") {
+			actualStatus = "running"
+		} else {
+			actualStatus = "stopped"
+		}
+	}
+
+	r.ActualValue = actualStatus
+	expected := strings.ToLower(fmt.Sprintf("%v", rule.Expected))
+	actual := strings.ToLower(actualStatus)
+	// Normalise Windows StartType casing
+	// "not_found" = service not installed → at least as secure as Disabled
+	switch actual {
+	case "not_found":
+		actual = "disabled"
+	case "disabled", "0":
+		actual = "disabled"
+	case "manual", "1":
+		actual = "manual"
+	case "automatic", "2":
+		actual = "automatic"
+	case "automaticdelayedstart", "boot", "system":
+		actual = actual
+	}
+	r.Status = evalOperator(actual, expected, rule.Operator)
+	return r
+}
+
+// ── Process ───────────────────────────────────────────────────────────────────
+
+func evalProcess(rule ComplianceRule, r ComplianceRuleResult) ComplianceRuleResult {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var running bool
+	switch runtime.GOOS {
+	case "windows":
+		out, err := newCmdContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive",
+			"-Command",
+			fmt.Sprintf(`(Get-Process -Name '%s' -ErrorAction SilentlyContinue | Measure-Object).Count`, rule.Target),
+		).Output()
+		if err == nil {
+			count := strings.TrimSpace(string(out))
+			n, _ := strconv.Atoi(count)
+			running = n > 0
+		}
+	default:
+		out, err := newCmdContext(ctx, "pgrep", "-x", rule.Target).Output()
+		running = err == nil && len(strings.TrimSpace(string(out))) > 0
+	}
+
+	r.ActualValue = running
+	expected := strings.ToLower(fmt.Sprintf("%v", rule.Expected))
+	// expected can be "true"/"running" for expecting the process to be running
+	expectRunning := expected == "true" || expected == "running"
+	if (running && expectRunning) || (!running && !expectRunning) {
+		r.Status = "pass"
+	} else {
+		r.Status = "fail"
+	}
+	return r
+}
+
+// ── Event Log (Windows only) ──────────────────────────────────────────────────
+
+func evalEventLog(rule ComplianceRule, r ComplianceRuleResult) ComplianceRuleResult {
+	if runtime.GOOS != "windows" {
+		r.Status = "skipped"
+		return r
+	}
+	// target format: "LogName|EventID" or "LogName|EventID|hours"
+	parts := strings.SplitN(rule.Target, "|", 3)
+	if len(parts) < 2 {
+		r.Status = "error"
+		r.ActualValue = "invalid target — expected LogName|EventID[|hours]"
+		return r
+	}
+	logName, eventID := parts[0], parts[1]
+	hours := "24"
+	if len(parts) == 3 {
+		hours = parts[2]
+	}
+
+	ps := fmt.Sprintf(
+		`(Get-WinEvent -FilterHashtable @{LogName='%s'; Id=%s; StartTime=(Get-Date).AddHours(-%s)} -ErrorAction SilentlyContinue | Measure-Object).Count`,
+		logName, eventID, hours,
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	out, err := newCmdContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps).Output()
+	if err != nil {
+		r.Status = "error"
+		r.ActualValue = err.Error()
+		return r
+	}
+	actual := strings.TrimSpace(string(out))
+	r.ActualValue = actual
+	r.Status = evalOperator(actual, fmt.Sprintf("%v", rule.Expected), rule.Operator)
+	return r
+}
+
+// ── Operator evaluation ───────────────────────────────────────────────────────
+
+func evalOperator(actual, expected, operator string) string {
+	switch operator {
+	case "eq":
+		if strings.EqualFold(strings.TrimSpace(actual), strings.TrimSpace(expected)) {
+			return "pass"
+		}
+		return "fail"
+	case "neq":
+		if !strings.EqualFold(strings.TrimSpace(actual), strings.TrimSpace(expected)) {
+			return "pass"
+		}
+		return "fail"
+	case "contains":
+		if strings.Contains(strings.ToLower(actual), strings.ToLower(expected)) {
+			return "pass"
+		}
+		return "fail"
+	case "not_contains":
+		if !strings.Contains(strings.ToLower(actual), strings.ToLower(expected)) {
+			return "pass"
+		}
+		return "fail"
+	case "exists":
+		return "pass"
+	case "not_exists":
+		return "fail"
+	case "gt":
+		a, err1 := strconv.ParseFloat(strings.TrimSpace(actual), 64)
+		e, err2 := strconv.ParseFloat(strings.TrimSpace(expected), 64)
+		if err1 != nil || err2 != nil {
+			return "error"
+		}
+		if a > e {
+			return "pass"
+		}
+		return "fail"
+	case "lt":
+		a, err1 := strconv.ParseFloat(strings.TrimSpace(actual), 64)
+		e, err2 := strconv.ParseFloat(strings.TrimSpace(expected), 64)
+		if err1 != nil || err2 != nil {
+			return "error"
+		}
+		if a < e {
+			return "pass"
+		}
+		return "fail"
+	case "regex":
+		re, err := regexp.Compile(expected)
+		if err != nil {
+			return "error"
+		}
+		if re.MatchString(actual) {
+			return "pass"
+		}
+		return "fail"
+	}
+	return "unknown"
+}
+
+func boolStatus(b bool) string {
+	if b {
+		return "pass"
+	}
+	return "fail"
+}
+
+// ── checkFirewallStatus ───────────────────────────────────────────────────────
+
+// checkFirewallStatus returns a simple status string without failing.
+func checkFirewallStatus() string {
+	switch runtime.GOOS {
+	case "windows":
+		// Registry-native (firewall_windows.go), same "profiles_enabled:N".
+		return windowsFirewallStatus()
+	case "linux":
+		if _, err := exec.LookPath("ufw"); err == nil {
+			out, _ := newCmd("ufw", "status").Output()
+			if strings.Contains(string(out), "active") {
+				return "ufw:active"
+			}
+			return "ufw:inactive"
+		}
+		if _, err := exec.LookPath("firewalld"); err == nil {
+			out, _ := newCmd("firewall-cmd", "--state").Output()
+			return "firewalld:" + strings.TrimSpace(string(out))
+		}
+		return "unknown"
+	case "darwin":
+		out, err := newCmd("/usr/libexec/ApplicationFirewall/socketfilterfw", "--getglobalstate").Output()
+		if err == nil {
+			return strings.TrimSpace(string(out))
+		}
+		return "unknown"
+	case "freebsd":
+		out, err := newCmd("pfctl", "-s", "info").CombinedOutput()
+		if err != nil {
+			return "unknown"
+		}
+		s := string(out)
+		if strings.Contains(s, "Status: Enabled") {
+			return "pf:active"
+		}
+		return "pf:inactive"
+	default:
+		return "unknown"
+	}
+}
+
+// postComplianceResults sends evaluated rule results to the server.
+func (d *CommandDispatcher) postComplianceResults(policyId interface{}, results []ComplianceRuleResult, score float64) {
+	payload := map[string]interface{}{
+		"policyId": policyId,
+		"results":  results,
+		"score":    score,
+		"platform": runtime.GOOS,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("postComplianceResults: marshal error: %v", err)
+		return
+	}
+	req, err := http.NewRequest("POST", d.serverURL+"/api/agent/compliance", bytes.NewReader(data))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", d.apiKey)
+	req.Header.Set("X-Device-UUID", currentDeviceUUID())
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("postComplianceResults: HTTP error: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		log.Printf("postComplianceResults: server returned %d", resp.StatusCode)
+	}
+}
+
+// runRemediationScript fetches the script by ID from the server and executes it.
+func (d *CommandDispatcher) runRemediationScript(scriptId string) error {
+	url := fmt.Sprintf("%s/api/scripts/%s", d.serverURL, scriptId)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("X-API-Key", d.apiKey)
+	req.Header.Set("X-Device-UUID", currentDeviceUUID())
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("fetch script: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("fetch script: server returned %d", resp.StatusCode)
+	}
+
+	var scriptData struct {
+		Runtime        string `json:"runtime"`
+		Content        string `json:"content"`
+		TimeoutSeconds int    `json:"timeoutSeconds"`
+		RunAs          string `json:"runAs"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&scriptData); err != nil {
+		return fmt.Errorf("decode script: %w", err)
+	}
+
+	_, err = ExecuteScript(ScriptCommand{
+		ID:             "remediation-" + scriptId,
+		Runtime:        scriptData.Runtime,
+		Content:        scriptData.Content,
+		TimeoutSeconds: scriptData.TimeoutSeconds,
+		RunAs:          scriptData.RunAs,
+	})
+	return err
+}
+
+func (d *CommandDispatcher) handleReboot(cmd AgentCommand) error {
+	log.Printf("Command %s: initiating system reboot...", cmd.ID)
+
+	// Parse optional delay from payload (default 60 seconds).
+	delaySecs := 60
+	if cmd.Payload != nil {
+		if v, ok := cmd.Payload["delaySeconds"].(float64); ok && v >= 0 {
+			delaySecs = int(v)
+		}
+	}
+
+	switch runtime.GOOS {
+	case "windows":
+		return newCmd("shutdown", "/r", "/t", fmt.Sprintf("%d", delaySecs)).Start()
+	case "linux", "darwin", "freebsd":
+		// `shutdown -r +N` uses N minutes; convert seconds to minutes (minimum 1).
+		delayMin := delaySecs / 60
+		if delayMin < 1 {
+			delayMin = 1
+		}
+		return newCmd("shutdown", "-r", fmt.Sprintf("+%d", delayMin)).Start()
+	default:
+		return fmt.Errorf("reboot: unsupported platform %s", runtime.GOOS)
+	}
+}
+
+// ── Custom section handlers ─────────────────────────────────────────────────
+
+func (d *CommandDispatcher) handleStartCustomSection(cmd AgentCommand) (map[string]any, error) {
+	streamID, _ := cmd.Payload["streamId"].(string)
+	command, _ := cmd.Payload["command"].(string)
+	runtimeStr, _ := cmd.Payload["runtime"].(string)
+	usePty, _ := cmd.Payload["usePty"].(bool)
+	cols := 120
+	rows := 30
+	if v, ok := cmd.Payload["cols"].(float64); ok && v > 0 {
+		cols = int(v)
+	}
+	if v, ok := cmd.Payload["rows"].(float64); ok && v > 0 {
+		rows = int(v)
+	}
+	if streamID == "" || command == "" {
+		return nil, fmt.Errorf("streamId and command are required")
+	}
+	if err := StartCustomSection(streamID, command, runtimeStr, usePty, cols, rows); err != nil {
+		return nil, err
+	}
+	return map[string]any{"streamId": streamID}, nil
+}
+
+func (d *CommandDispatcher) handleStopCustomSection(cmd AgentCommand) error {
+	streamID, _ := cmd.Payload["streamId"].(string)
+	if streamID != "" {
+		StopCustomSection(streamID)
+	}
+	return nil
+}
+
+func (d *CommandDispatcher) handleResizeCustomSection(cmd AgentCommand) error {
+	streamID, _ := cmd.Payload["streamId"].(string)
+	cols := 120
+	rows := 30
+	if v, ok := cmd.Payload["cols"].(float64); ok && v > 0 {
+		cols = int(v)
+	}
+	if v, ok := cmd.Payload["rows"].(float64); ok && v > 0 {
+		rows = int(v)
+	}
+	if streamID != "" {
+		ResizeCustomSection(streamID, cols, rows)
+	}
+	return nil
+}
+
+// redactPayloadPassword wipes password fields from the command payload so
+// they cannot be logged or echoed back in acks.
+func (d *CommandDispatcher) redactPayloadPassword(cmd *AgentCommand) {
+	if cmd.Payload == nil {
+		return
+	}
+	for _, k := range []string{"password", "oldPassword", "newPassword"} {
+		delete(cmd.Payload, k)
+	}
+}
+
+// ── Privacy gate handlers ───────────────────────────────────────────────────
+//
+// Passwords arrive plaintext in the command payload and are verified locally
+// against a scrypt hash. They are NEVER logged, never written to disk, and
+// never echoed back in results.
+
+func (d *CommandDispatcher) handleSetPrivacyPassword(cmd AgentCommand) (map[string]any, error) {
+	pw, _ := cmd.Payload["password"].(string)
+	if pw == "" {
+		return nil, fmt.Errorf("missing password")
+	}
+	if err := SetPrivacyPassword(pw); err != nil {
+		return nil, err
+	}
+	return map[string]any{"passwordSet": true}, nil
+}
+
+func (d *CommandDispatcher) handleChangePrivacyPassword(cmd AgentCommand) (map[string]any, error) {
+	oldPw, _ := cmd.Payload["oldPassword"].(string)
+	newPw, _ := cmd.Payload["newPassword"].(string)
+	if oldPw == "" || newPw == "" {
+		return nil, fmt.Errorf("missing old or new password")
+	}
+	if err := ChangePrivacyPassword(oldPw, newPw); err != nil {
+		return nil, err
+	}
+	return map[string]any{"passwordSet": true}, nil
+}
+
+func (d *CommandDispatcher) handleRemovePrivacyPassword(cmd AgentCommand) (map[string]any, error) {
+	pw, _ := cmd.Payload["password"].(string)
+	if pw == "" {
+		return nil, fmt.Errorf("missing password")
+	}
+	if err := RemovePrivacyPassword(pw); err != nil {
+		return nil, err
+	}
+	return map[string]any{"passwordSet": false}, nil
+}
+
+func (d *CommandDispatcher) handleVerifyPrivacyPassword(cmd AgentCommand) (map[string]any, error) {
+	pw, _ := cmd.Payload["password"].(string)
+	feature, _ := cmd.Payload["feature"].(string)
+	if pw == "" {
+		return nil, fmt.Errorf("missing password")
+	}
+	token, err := VerifyPrivacyPassword(pw, feature)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"unlockToken": token,
+		"feature":     feature,
+		"ttlSeconds":  int(unlockTTL.Seconds()),
+	}, nil
+}
+
+func (d *CommandDispatcher) handleSleep(cmd AgentCommand) error {
+	log.Printf("Command %s: suspending system...", cmd.ID)
+
+	switch runtime.GOOS {
+	case "windows":
+		// Windows sleep from a SYSTEM service is tricky:
+		//   - rundll32 powrprof.dll,SetSuspendState 0,1,0 will HIBERNATE
+		//     instead of sleep when hibernation is enabled (very common on
+		//     laptops with Fast Startup).
+		//   - A reliable approach is to disable hibernate first so SetSuspendState
+		//     does a real S3 sleep, then call it.
+		// We use PowerShell to invoke SetSuspendState via P/Invoke directly,
+		// which respects the "sleep vs hibernate" flag explicitly.
+		script := `
+$ErrorActionPreference = 'Stop'
+$sig = @'
+[DllImport("Powrprof.dll", CharSet=CharSet.Auto, ExactSpelling=true)]
+public static extern bool SetSuspendState(bool Hibernate, bool ForceCritical, bool DisableWakeEvent);
+'@
+$type = Add-Type -MemberDefinition $sig -Name PowerState -Namespace Win32 -PassThru
+# Hibernate=$false -> real S3 sleep; ForceCritical=$false; DisableWakeEvent=$false
+[void]$type::SetSuspendState($false, $false, $false)
+`
+		return newCmd("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script).Start()
+
+	case "linux":
+		// Try systemd first (covers 99% of modern distros).
+		if err := newCmd("systemctl", "suspend").Run(); err == nil {
+			return nil
+		}
+		// Fallbacks for non-systemd or locked-down envs.
+		if err := newCmd("loginctl", "suspend").Run(); err == nil {
+			return nil
+		}
+		if err := newCmd("pm-suspend").Run(); err == nil {
+			return nil
+		}
+		return fmt.Errorf("no working suspend command found (systemd/loginctl/pm-suspend all failed)")
+
+	case "darwin":
+		// pmset sleepnow is the canonical macOS sleep command and works as root.
+		return newCmd("pmset", "sleepnow").Run()
+
+	case "freebsd":
+		return newCmd("acpiconf", "-s", "3").Run()
+
+	default:
+		return fmt.Errorf("sleep: unsupported platform %s", runtime.GOOS)
+	}
+}
+
+func (d *CommandDispatcher) handleShutdown(cmd AgentCommand) error {
+	log.Printf("Command %s: initiating system shutdown...", cmd.ID)
+
+	delaySecs := 60
+	if cmd.Payload != nil {
+		if v, ok := cmd.Payload["delaySeconds"].(float64); ok && v >= 0 {
+			delaySecs = int(v)
+		}
+	}
+
+	switch runtime.GOOS {
+	case "windows":
+		return newCmd("shutdown", "/s", "/t", fmt.Sprintf("%d", delaySecs)).Start()
+	case "linux", "darwin", "freebsd":
+		delayMin := delaySecs / 60
+		if delayMin < 1 {
+			delayMin = 1
+		}
+		return newCmd("shutdown", "-h", fmt.Sprintf("+%d", delayMin)).Start()
+	default:
+		return fmt.Errorf("shutdown: unsupported platform %s", runtime.GOOS)
+	}
+}
+
+// linuxHasSystemd returns true when systemd is the running init
+// system. We detect it via `systemctl` on PATH — fast, doesn't
+// require root, and works whether or not the agent is itself a
+// systemd unit. On CentOS 6 / RHEL 6 / Debian 7 / older builds
+// `systemctl` is absent and we fall back to the SysV-init `service`
+// command + `/etc/init.d/*` listing.
+func linuxHasSystemd() bool {
+	_, err := exec.LookPath("systemctl")
+	return err == nil
+}
+
+// listServicesSysV enumerates SysV-init services for the dashboard's
+// Services tab on hosts without systemd. We list every executable
+// under /etc/init.d (skipping the `functions` library script and any
+// dotfiles), then run `service <name> status` per entry with a 2 s
+// timeout so a hung legacy script can't freeze the whole call.
+// LSB-compliant scripts exit 0 when running and non-zero otherwise;
+// status text is also parsed as a fallback for non-LSB scripts that
+// always exit 0 but emit "is stopped" / "is running" on stdout.
+func listServicesSysV() (interface{}, error) {
+	entries, err := os.ReadDir("/etc/init.d")
+	if err != nil {
+		return map[string]interface{}{"services": []ServiceInfo{}, "count": 0}, nil
+	}
+	services := make([]ServiceInfo, 0, len(entries))
+	for _, ent := range entries {
+		if ent.IsDir() {
+			continue
+		}
+		name := ent.Name()
+		// Skip helpers / dotfiles. `functions` on RHEL 6 is a shell
+		// library sourced by the init scripts, not a service itself.
+		if strings.HasPrefix(name, ".") || name == "functions" || strings.HasSuffix(name, ".rpmsave") || strings.HasSuffix(name, ".rpmnew") {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		out, statusErr := newCmdContext(ctx, "service", name, "status").CombinedOutput()
+		cancel()
+		status := "unknown"
+		lower := strings.ToLower(string(out))
+		switch {
+		case strings.Contains(lower, "is stopped"), strings.Contains(lower, "not running"), strings.Contains(lower, "is dead"):
+			status = "stopped"
+		case strings.Contains(lower, "is running"), strings.Contains(lower, "active (running)"), strings.Contains(lower, "running..."):
+			status = "running"
+		default:
+			// LSB: exit 0 = running, exit 3 = stopped, anything else
+			// = error → leave "unknown". Some legacy non-LSB scripts
+			// (incl. Obliance's own SysV init) just echo
+			// "Running"/"Stopped" without setting an LSB exit, so we
+			// also check the verbatim word.
+			if statusErr == nil {
+				if strings.Contains(lower, "running") {
+					status = "running"
+				} else if strings.Contains(lower, "stopped") {
+					status = "stopped"
+				} else {
+					status = "running"
+				}
+			} else if strings.Contains(lower, "stopped") {
+				status = "stopped"
+			}
+		}
+		services = append(services, ServiceInfo{Name: name, Status: status})
+	}
+	return map[string]interface{}{"services": services, "count": len(services)}, nil
+}
+
+// ServiceInfo describes a single OS service returned by list_services.
+type ServiceInfo struct {
+	Name        string `json:"name"`
+	DisplayName string `json:"displayName,omitempty"`
+	Status      string `json:"status"`              // running, stopped, unknown
+	StartType   string `json:"startType,omitempty"` // auto, manual, disabled, unknown
+	RunAsUser   string `json:"runAsUser,omitempty"` // account the service runs as
+}
+
+// listServicesSystemdText parses `systemctl list-units` plain-text output — the
+// fallback for systemd versions without --output=json (CentOS 7 / 8 Stream).
+// Columns: UNIT LOAD ACTIVE SUB DESCRIPTION.
+func listServicesSystemdText() []ServiceInfo {
+	out, err := newCmd("systemctl", "list-units", "--type=service",
+		"--all", "--no-legend", "--no-pager", "--plain").Output()
+	if err != nil {
+		return []ServiceInfo{}
+	}
+	services := make([]ServiceInfo, 0)
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 || !strings.HasSuffix(fields[0], ".service") {
+			continue
+		}
+		status := "stopped"
+		if fields[2] == "active" {
+			status = "running"
+		}
+		desc := ""
+		if len(fields) >= 5 {
+			desc = strings.Join(fields[4:], " ")
+		}
+		services = append(services, ServiceInfo{Name: fields[0], DisplayName: desc, Status: status})
+	}
+	return services
+}
+
+func (d *CommandDispatcher) handleListServices(_ AgentCommand) (interface{}, error) {
+	switch runtime.GOOS {
+	case "windows":
+		// Native SCM enumeration (services_windows.go): same fields and
+		// strings as the former Win32_Service query (State / StartMode /
+		// StartName lower-cased), on every Windows version — PowerShell 2.0
+		// (Windows 7 / 2008 R2) has neither Get-CimInstance nor ConvertTo-Json.
+		services, err := listServicesNative()
+		if err != nil {
+			return nil, fmt.Errorf("list_services: %w", err)
+		}
+		return map[string]interface{}{"services": services, "count": len(services)}, nil
+
+	case "linux":
+		// SysV-init fallback (CentOS 6, RHEL 6, etc. — anything without
+		// systemd): list every script in /etc/init.d, then run
+		// `service <name> status` per entry to derive state. The status
+		// call is bounded by a short context so a hung legacy script
+		// can't freeze the whole listing.
+		if !linuxHasSystemd() {
+			return listServicesSysV()
+		}
+		// systemd >= 246 supports --output=json; older (CentOS 7 = systemd 219,
+		// CentOS 8 Stream = 239) do not — the flag errors, so instead of returning
+		// an empty list we fall back to parsing the plain text listing, which works
+		// on every systemd version.
+		services := make([]ServiceInfo, 0)
+		jsonOk := false
+		if out, err := newCmd("systemctl", "list-units", "--type=service",
+			"--all", "--no-pager", "--output=json").Output(); err == nil {
+			var units []map[string]interface{}
+			if json.Unmarshal(out, &units) == nil {
+				jsonOk = true
+				for _, u := range units {
+					name, _ := u["unit"].(string)
+					desc, _ := u["description"].(string)
+					active, _ := u["active"].(string)
+					status := "stopped"
+					if active == "active" {
+						status = "running"
+					}
+					services = append(services, ServiceInfo{Name: name, DisplayName: desc, Status: status})
+				}
+			}
+		}
+		if !jsonOk {
+			services = listServicesSystemdText()
+		}
+		// Bulk-fetch User= and UnitFileState= (start type) for all units in
+		// one systemctl show call.
+		if len(services) > 0 {
+			unitNames := make([]string, len(services))
+			for i, s := range services {
+				unitNames[i] = s.Name
+			}
+			args := append([]string{"show", "--property=Id,User,UnitFileState"}, unitNames...)
+			showOut, showErr := newCmd("systemctl", args...).Output()
+			if showErr == nil {
+				// Output: "Id=unit.service\nUser=username\n\nId=...\nUser=...\n"
+				userMap := make(map[string]string)
+				startMap := make(map[string]string)
+				for _, block := range strings.Split(strings.TrimSpace(string(showOut)), "\n\n") {
+					var id, user, unitFileState string
+					for _, line := range strings.Split(block, "\n") {
+						if strings.HasPrefix(line, "Id=") {
+							id = strings.TrimPrefix(line, "Id=")
+						} else if strings.HasPrefix(line, "User=") {
+							user = strings.TrimPrefix(line, "User=")
+						} else if strings.HasPrefix(line, "UnitFileState=") {
+							unitFileState = strings.TrimPrefix(line, "UnitFileState=")
+						}
+					}
+					if id != "" {
+						if user == "" {
+							user = "root"
+						}
+						userMap[id] = user
+						startMap[id] = systemdStartTypeName(unitFileState)
+					}
+				}
+				for i := range services {
+					if u, ok := userMap[services[i].Name]; ok {
+						services[i].RunAsUser = u
+					}
+					if st := startMap[services[i].Name]; st != "" {
+						services[i].StartType = st
+					}
+				}
+			}
+		}
+		return map[string]interface{}{"services": services, "count": len(services)}, nil
+
+	case "darwin":
+		out, err := newCmd("launchctl", "list").Output()
+		if err != nil {
+			return nil, fmt.Errorf("list_services: launchctl failed: %w", err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		services := make([]ServiceInfo, 0, len(lines))
+		for _, line := range lines[1:] { // skip header: PID Status Label
+			fields := strings.Fields(line)
+			if len(fields) < 3 {
+				continue
+			}
+			pidStr := fields[0]
+			status := "stopped"
+			runAsUser := ""
+			if pidStr != "-" {
+				status = "running"
+				// Resolve the user from the running PID.
+				psOut, psErr := newCmd("ps", "-p", pidStr, "-o", "user=").Output()
+				if psErr == nil {
+					runAsUser = strings.TrimSpace(string(psOut))
+				}
+			}
+			services = append(services, ServiceInfo{Name: fields[2], Status: status, RunAsUser: runAsUser})
+		}
+		return map[string]interface{}{"services": services, "count": len(services)}, nil
+
+	case "freebsd":
+		// List enabled services via `service -e`, then check status of each.
+		out, err := newCmd("service", "-e").Output()
+		if err != nil {
+			return nil, fmt.Errorf("list_services: service -e failed: %w", err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		services := make([]ServiceInfo, 0, len(lines))
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			// `service -e` returns full paths like /etc/rc.d/sshd; extract base name.
+			name := line
+			if idx := strings.LastIndex(line, "/"); idx >= 0 {
+				name = line[idx+1:]
+			}
+			status := "stopped"
+			statusOut, statusErr := newCmd("service", name, "status").CombinedOutput()
+			if statusErr == nil && strings.Contains(strings.ToLower(string(statusOut)), "is running") {
+				status = "running"
+			}
+			services = append(services, ServiceInfo{Name: name, Status: status})
+		}
+		return map[string]interface{}{"services": services, "count": len(services)}, nil
+
+	default:
+		return nil, fmt.Errorf("list_services: unsupported platform %s", runtime.GOOS)
+	}
+}
+
+func (d *CommandDispatcher) handleRestartService(cmd AgentCommand) (interface{}, error) {
+	name := payloadString(cmd.Payload, "name")
+	if name == "" {
+		return nil, fmt.Errorf("restart_service: name not specified")
+	}
+
+	switch runtime.GOOS {
+	case "windows":
+		// Native SCM = Restart-Service -Force (services_windows.go); "output"
+		// keeps the former `-PassThru | ConvertTo-Json` shape.
+		out, err := restartServiceNative(name)
+		if err != nil {
+			return nil, fmt.Errorf("restart_service: %w", err)
+		}
+		return map[string]string{"name": name, "output": out}, nil
+
+	case "linux":
+		if !linuxHasSystemd() {
+			out, err := newCmd("service", name, "restart").CombinedOutput()
+			if err != nil {
+				return nil, fmt.Errorf("restart_service: service %s restart failed: %s", name, strings.TrimSpace(string(out)))
+			}
+			return map[string]string{"name": name, "status": "restarted"}, nil
+		}
+		out, err := newCmd("systemctl", "restart", name).CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("restart_service: systemctl restart %s failed: %s", name, strings.TrimSpace(string(out)))
+		}
+		return map[string]string{"name": name, "status": "restarted"}, nil
+
+	case "darwin":
+		// Attempt launchctl kickstart then stop+start as fallback.
+		out, err := newCmd("launchctl", "kickstart", "-k", name).CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("restart_service: launchctl kickstart %s failed: %s", name, strings.TrimSpace(string(out)))
+		}
+		return map[string]string{"name": name, "status": "restarted"}, nil
+
+	case "freebsd":
+		out, err := newCmd("service", name, "restart").CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("restart_service: service %s restart failed: %s", name, strings.TrimSpace(string(out)))
+		}
+		return map[string]string{"name": name, "status": "restarted"}, nil
+
+	default:
+		return nil, fmt.Errorf("restart_service: unsupported platform %s", runtime.GOOS)
+	}
+}
+
+func (d *CommandDispatcher) handleStartService(cmd AgentCommand) (interface{}, error) {
+	name := payloadString(cmd.Payload, "name")
+	if name == "" {
+		return nil, fmt.Errorf("start_service: name not specified")
+	}
+
+	switch runtime.GOOS {
+	case "windows":
+		// Native SCM = Start-Service (waits up to 60 s for RUNNING).
+		out, err := startServiceNative(name)
+		if err != nil {
+			return nil, fmt.Errorf("start_service: %w", err)
+		}
+		return map[string]string{"name": name, "output": out}, nil
+
+	case "linux":
+		if !linuxHasSystemd() {
+			out, err := newCmd("service", name, "start").CombinedOutput()
+			if err != nil {
+				return nil, fmt.Errorf("start_service: service %s start failed: %s", name, strings.TrimSpace(string(out)))
+			}
+			return map[string]string{"name": name, "status": "started"}, nil
+		}
+		out, err := newCmd("systemctl", "start", name).CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("start_service: systemctl start %s failed: %s", name, strings.TrimSpace(string(out)))
+		}
+		return map[string]string{"name": name, "status": "started"}, nil
+
+	case "darwin":
+		out, err := newCmd("launchctl", "start", name).CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("start_service: launchctl start %s failed: %s", name, strings.TrimSpace(string(out)))
+		}
+		return map[string]string{"name": name, "status": "started"}, nil
+
+	case "freebsd":
+		out, err := newCmd("service", name, "start").CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("start_service: service %s start failed: %s", name, strings.TrimSpace(string(out)))
+		}
+		return map[string]string{"name": name, "status": "started"}, nil
+
+	default:
+		return nil, fmt.Errorf("start_service: unsupported platform %s", runtime.GOOS)
+	}
+}
+
+func (d *CommandDispatcher) handleStopService(cmd AgentCommand) (interface{}, error) {
+	name := payloadString(cmd.Payload, "name")
+	if name == "" {
+		return nil, fmt.Errorf("stop_service: name not specified")
+	}
+
+	switch runtime.GOOS {
+	case "windows":
+		// Native SCM = Stop-Service -Force (active dependents stopped first).
+		out, _, err := stopServiceNative(name)
+		if err != nil {
+			return nil, fmt.Errorf("stop_service: %w", err)
+		}
+		return map[string]string{"name": name, "output": out}, nil
+
+	case "linux":
+		if !linuxHasSystemd() {
+			out, err := newCmd("service", name, "stop").CombinedOutput()
+			if err != nil {
+				return nil, fmt.Errorf("stop_service: service %s stop failed: %s", name, strings.TrimSpace(string(out)))
+			}
+			return map[string]string{"name": name, "status": "stopped"}, nil
+		}
+		out, err := newCmd("systemctl", "stop", name).CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("stop_service: systemctl stop %s failed: %s", name, strings.TrimSpace(string(out)))
+		}
+		return map[string]string{"name": name, "status": "stopped"}, nil
+
+	case "darwin":
+		out, err := newCmd("launchctl", "stop", name).CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("stop_service: launchctl stop %s failed: %s", name, strings.TrimSpace(string(out)))
+		}
+		return map[string]string{"name": name, "status": "stopped"}, nil
+
+	case "freebsd":
+		out, err := newCmd("service", name, "stop").CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("stop_service: service %s stop failed: %s", name, strings.TrimSpace(string(out)))
+		}
+		return map[string]string{"name": name, "status": "stopped"}, nil
+
+	default:
+		return nil, fmt.Errorf("stop_service: unsupported platform %s", runtime.GOOS)
+	}
+}
+
+func (d *CommandDispatcher) handleRestartAgent(cmd AgentCommand) error {
+	log.Printf("Command %s: restarting agent service...", cmd.ID)
+	// Restart after a short delay so the WS ack can be sent first.
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		switch runtime.GOOS {
+		case "windows":
+			// On Windows, os.Exit(0) is treated as a clean/intentional service stop:
+			// the SCM does NOT trigger recovery/restart actions.
+			// Use PowerShell Restart-Service to properly stop then restart via SCM.
+			log.Printf("Restarting OblianceAgent service via PowerShell...")
+			_ = newCmd("powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+				"Restart-Service -Name OblianceAgent -Force").Start()
+			// The SCM stop signal will eventually terminate this process.
+			// Sleep as a safety fallback in case Restart-Service doesn't kill us.
+			time.Sleep(10 * time.Second)
+			os.Exit(0)
+		case "freebsd":
+			log.Printf("Restarting obliance_agent service via service command...")
+			_ = newCmd("service", "obliance_agent", "restart").Start()
+			time.Sleep(10 * time.Second)
+			os.Exit(0)
+		case "darwin":
+			// kickstart -k makes launchd kill and relaunch the job itself
+			// (never load/unload, which would leave a disabled job down).
+			// Detached so launchctl is not part of the process group launchd
+			// tears down with us.
+			log.Printf("Restarting com.obliance.agent via launchctl kickstart -k...")
+			kc := newCmd("launchctl", "kickstart", "-k", "system/com.obliance.agent")
+			kc.SysProcAttr = detachedProc()
+			_ = kc.Start()
+			// launchd will SIGTERM this process; safety fallback (KeepAlive).
+			time.Sleep(10 * time.Second)
+			os.Exit(0)
+		default:
+			// Linux: os.Exit(0) causes systemd to restart the process (Restart=always).
+			os.Exit(0)
+		}
+	}()
+	return nil
+}
+
+// handleUpdateAgent applies an agent update on admin request (the update_agent
+// command). Unlike the removed auto-update path, this is explicit and FORCED:
+// it applies the target version (from the command payload, else the latest
+// published version) regardless of version comparison — the admin asked for it.
+// Arch-aware MSI selection (x86 vs x64) happens inside applyUpdateIfNewer. The
+// update runs in a goroutine after a short delay so the command ack is sent
+// first; msiserver (Windows) / the service manager (Unix) then restarts the
+// agent on the new version. No-op safety: the updateMu guard inside
+// applyUpdateIfNewer prevents concurrent updates.
+func (d *CommandDispatcher) handleUpdateAgent(cmd AgentCommand) error {
+	cfg := d.makeConfig()
+	target, _ := cmd.Payload["version"].(string)
+	if target == "" {
+		target = fetchLatestVersion(cfg)
+	}
+	if target == "" {
+		return fmt.Errorf("update_agent: could not resolve a target version")
+	}
+	log.Printf("Command %s: admin-triggered agent update to %s", cmd.ID, target)
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		applyUpdateIfNewer(cfg, target, true)
+	}()
+	return nil
+}
+
+// ── ExecuteSync ───────────────────────────────────────────────────────────────
+
+// ExecuteSync runs a command synchronously and returns (result, error).
+// Used by the WS command channel so results can be sent back immediately
+// without waiting for the next HTTP push cycle.
+func (d *CommandDispatcher) ExecuteSync(cmd AgentCommand) (interface{}, error) {
+	if IsPrivacyMode() && isBlockedByPrivacy(cmd.Type) {
+		bypass, _ := cmd.Payload["bypassPrivacy"].(bool)
+		token, _ := cmd.Payload["unlockToken"].(string)
+		if !bypass && !CheckUnlockToken(token, privacyFeatureForCommand(cmd.Type)) {
+			return nil, fmt.Errorf("privacy mode is enabled — remote access denied")
+		}
+	}
+	switch cmd.Type {
+	case "ssh_jump_grant":
+		return d.handleSshJumpGrant(cmd)
+	case "ssh_jump_revoke":
+		return d.handleSshJumpRevoke(cmd)
+	case "scan_inventory":
+		return d.handleScanInventory(cmd)
+	case "scan_updates":
+		return d.handleScanUpdates(cmd)
+	case "run_script":
+		return d.handleRunScript(cmd)
+	case "cancel_script":
+		return d.handleCancelScript(cmd)
+	case "install_update":
+		return d.handleInstallUpdate(cmd)
+	case "install_updates":
+		return d.handleInstallUpdates(cmd)
+	case "check_compliance":
+		return d.handleCheckCompliance(cmd)
+	case "remediate_rule":
+		return d.handleRemediateRule(cmd)
+	case "scan_network":
+		return d.handleScanNetwork(cmd)
+	case "list_wts_sessions":
+		return d.handleListWtsSessions(cmd)
+	case "list_processes":
+		return d.handleListProcesses(cmd)
+	case "kill_process":
+		return d.handleKillProcess(cmd)
+	case "list_directory":
+		return d.handleListDirectory(cmd)
+	case "create_directory":
+		return d.handleCreateDirectory(cmd)
+	case "rename_file":
+		return d.handleRenameFile(cmd)
+	case "delete_file":
+		return d.handleDeleteFile(cmd)
+	case "download_file":
+		return d.handleDownloadFile(cmd)
+	case "upload_file":
+		return d.handleUploadFile(cmd)
+	case "start_usage_scan":
+		return d.handleStartUsageScan(cmd)
+	case "get_usage_children":
+		return d.handleGetUsageChildren(cmd)
+	case "get_usage_top_files":
+		return d.handleGetUsageTopFiles(cmd)
+	case "cancel_usage_scan":
+		return d.handleCancelUsageScan(cmd)
+	case "list_services":
+		return d.handleListServices(cmd)
+	case "restart_service":
+		return d.handleRestartService(cmd)
+	case "start_service":
+		return d.handleStartService(cmd)
+	case "stop_service":
+		return d.handleStopService(cmd)
+	case "set_service_start_type":
+		res, err := d.handleSetServiceStartType(cmd)
+		if err == nil {
+			go d.collectAndPostServices()
+		}
+		return res, err
+	case "reboot":
+		return nil, d.handleReboot(cmd)
+	case "shutdown":
+		return nil, d.handleShutdown(cmd)
+	case "sleep":
+		return nil, d.handleSleep(cmd)
+	case "restart_agent":
+		return nil, d.handleRestartAgent(cmd)
+	case "update_agent":
+		return nil, d.handleUpdateAgent(cmd)
+	case "uninstall_agent":
+		return nil, d.handleUninstallAgent()
+	case "install_oblireach":
+		return d.handleInstallOblireach(cmd)
+	case "install_vm_console":
+		return d.handleInstallVmConsole(cmd)
+	case "disable_privacy_mode":
+		if err := SetPrivacyMode(false, "remote"); err != nil {
+			return nil, err
+		}
+		return map[string]string{"message": "privacy mode disabled"}, nil
+	case "enable_privacy_mode":
+		if err := SetPrivacyMode(true, "remote"); err != nil {
+			return nil, err
+		}
+		return map[string]string{"message": "privacy mode enabled"}, nil
+	case "set_privacy_password":
+		return d.handleSetPrivacyPassword(cmd)
+	case "change_privacy_password":
+		return d.handleChangePrivacyPassword(cmd)
+	case "remove_privacy_password":
+		return d.handleRemovePrivacyPassword(cmd)
+	case "verify_privacy_password":
+		return d.handleVerifyPrivacyPassword(cmd)
+	case "start_custom_section":
+		return d.handleStartCustomSection(cmd)
+	case "stop_custom_section":
+		return nil, d.handleStopCustomSection(cmd)
+	case "resize_custom_section":
+		return nil, d.handleResizeCustomSection(cmd)
+	case "enable_airgap":
+		serverIPs, _ := cmd.Payload["serverIPs"].([]interface{})
+		ips := make([]string, 0, len(serverIPs))
+		for _, v := range serverIPs {
+			if s, ok := v.(string); ok {
+				ips = append(ips, s)
+			}
+		}
+		if err := SetAirgapMode(true, "remote", ips); err != nil {
+			return nil, err
+		}
+		return map[string]string{"message": "airgap enabled"}, nil
+	case "disable_airgap":
+		if err := SetAirgapMode(false, "remote", nil); err != nil {
+			return nil, err
+		}
+		return map[string]string{"message": "airgap disabled"}, nil
+	// Hyper-V + Veeam: these arrive over the WS command channel (live tab pings,
+	// ephemeral console thumbnails, refresh, control actions). They exist in the
+	// async executeCommand switch too, but WS commands flow through ExecuteSync —
+	// without these branches they hit `default` and the agent answers
+	// "unknown command type". That is exactly what left the Hyper-V console blank
+	// and forced Veeam/Hyper-V live updates to rely on the slow inventory cadence.
+	// KEEP IN SYNC with executeCommand's switch.
+	case "hyperv_list_vms":
+		return d.handleHyperVListVMs(cmd)
+	case "hyperv_control":
+		return d.handleHyperVControl(cmd)
+	case "hyperv_console_thumbnail":
+		return d.handleHyperVConsoleThumbnail(cmd)
+	case "veeam_list_jobs":
+		return d.handleVeeamListJobs(cmd)
+	case "veeam_control":
+		return d.handleVeeamControl(cmd)
+	case "live_metrics":
+		// Mirror of the HandleCommand case — required because incoming WS
+		// commands flow through ExecuteSync, not HandleCommand. Without
+		// this branch the live-metrics command falls into `default` and
+		// the agent rejects it with "unknown command type", so the page
+		// never sees a `metrics_sample` and CPU/RAM look frozen.
+		mode, _ := cmd.Payload["mode"].(string)
+		if mode == "live" {
+			windowSec := 60.0
+			if w, ok := cmd.Payload["windowSec"].(float64); ok && w > 0 {
+				windowSec = w
+			}
+			TriggerLiveMetrics(int(windowSec))
+		} else {
+			TriggerImmediatePush()
+		}
+		return map[string]string{"message": "live metrics ack"}, nil
+	default:
+		return nil, fmt.Errorf("unknown command type: %s", cmd.Type)
+	}
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+// makeConfig returns a minimal Config suitable for making HTTP calls.
+// The full Config is not stored in the dispatcher to avoid tight coupling —
+// we only need the three connection fields.
+func (d *CommandDispatcher) makeConfig() *Config {
+	return &Config{
+		DeviceUUID: currentDeviceUUID(),
+		APIKey:     d.apiKey,
+		ServerURL:  d.serverURL,
+	}
+}
+
+// collectAndPostServices runs list_services and immediately POSTs the result.
+// Called by the service watcher goroutine and after start/stop/restart actions.
+func (d *CommandDispatcher) collectAndPostServices() {
+	cfg := d.makeConfig()
+	result, err := d.handleListServices(AgentCommand{ID: generateUUID(), Type: "list_services"})
+	if err != nil {
+		log.Printf("collectAndPostServices: %v", err)
+		return
+	}
+	raw, ok := result.(map[string]interface{})
+	if !ok {
+		return
+	}
+	svcs, ok := raw["services"]
+	if !ok {
+		return
+	}
+	b, _ := json.Marshal(svcs)
+	var services []ServiceInfo
+	if err := json.Unmarshal(b, &services); err == nil {
+		postServices(services, cfg)
+	}
+}
+
+// postServices pushes the current service list to the server so it can be
+// stored as latest_services and broadcast to connected clients via socket.
+func postServices(services []ServiceInfo, cfg *Config) {
+	if cfg == nil || len(services) == 0 {
+		return
+	}
+	body := map[string]interface{}{"services": services}
+	b, err := json.Marshal(body)
+	if err != nil {
+		log.Printf("postServices: marshal error: %v", err)
+		return
+	}
+	req, err := http.NewRequest("POST", cfg.ServerURL+"/api/agent/services", bytes.NewReader(b))
+	if err != nil {
+		log.Printf("postServices: build request error: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", cfg.APIKey)
+	req.Header.Set("X-Device-UUID", currentDeviceUUID())
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("postServices: request error: %v", err)
+		return
+	}
+	resp.Body.Close()
+}
+
+// payloadString is a helper to extract a string value from a command payload.
+func payloadString(payload map[string]interface{}, key string) string {
+	if payload == nil {
+		return ""
+	}
+	if v, ok := payload[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+// payloadJSON is a helper to re-marshal a payload value to JSON bytes.
+func payloadJSON(payload map[string]interface{}, key string) []byte {
+	if payload == nil {
+		return nil
+	}
+	if v, ok := payload[key]; ok {
+		b, _ := json.Marshal(v)
+		return b
+	}
+	return nil
+}

@@ -1,0 +1,146 @@
+# ══════════════════════════════════════════════════════════════════════
+#  Obliance — the repository only carries what is needed to BUILD the tool.
+#  Everything else (docs, notes, tooling, local data) stays on the workstation.
+# ══════════════════════════════════════════════════════════════════════
+
+# ── Dependencies / build outputs ──
+node_modules/
+dist/
+!agent/dist/
+agent/dist/*.exe
+agent/dist/*.wixpdb
+desktop-app/dist/*.wixpdb
+agent/bin/*.exe
+agent/*.exe
+!desktop-app/dist/
+!oblireach-desktop/dist/
+oblireach-desktop/dist/*.wixpdb
+# Oblireach Desktop Linux (Flatpak): OSTree repo + bundles are build outputs
+# (tens of MB, thousands of files per release), copied in before the server
+# image build like agent/dist — never committed.
+oblireach-desktop/linux/*
+!oblireach-desktop/linux/.gitkeep
+*.wixpdb
+*.exe
+coverage/
+*.tsbuildinfo
+_oblitools_dist_stage/
+000-RegularUpdate.lock
+*.lock
+
+# Build-time //go:embed payloads that the wizard sources copy in before
+# compilation and remove after. The canonical binaries live in agent/dist/.
+agent/cmd/wizard/obliance-agent.msi
+agent/cmd/wizard-linux/obliance-agent
+
+# Obli mobile (Android): build outputs, Gradle state and signing material.
+# mobile/release/ only commits manifest.json (served by the server image).
+mobile/release/*.apk
+mobile/release-native/
+mobile/android/local.properties
+mobile/android/.gradle/
+mobile/android/**/build/
+*.apk
+*.aab
+*.dmg
+local.properties
+keystore.properties
+
+# ── Editors / OS ──
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# ── Hidden tool folders and files (tool state, caches, local harnesses) ──
+# Every dot-folder, at any depth, plus every dot-file at the root, except the
+# few repository files listed right after.
+.*/
+/.*
+!/.gitignore
+!/.gitattributes
+!/.dockerignore
+!/.env.example
+!/.github/
+
+# ── Secrets / environment ──
+.env
+.env.*
+!.env.example
+.secrets/
+secrets/
+*.jks
+*.keystore
+*.pem
+!/agent/fallback_roots.pem
+*.key
+*.pfx
+*.p12
+*.crt
+*.cer
+*.csr
+*.ppk
+id_rsa*
+id_ed25519*
+id_ecdsa*
+host_rsa*
+
+# ── Runtime data, logs, dumps, backups ──
+custom/
+logs/
+*.log
+**/*.log
+*.bak
+*.orig
+*.rej
+*.tmp
+*.pre-*
+*.sqlite
+*.sqlite3
+*.db
+*.sql
+*.dump
+*.csv
+*.xlsx
+*.har
+*.pcap
+*.zip
+!/agent/dist/vmconsole.zip
+*.txt
+!/agent/dist/oblireach-version.txt
+!/mobile/android/core/designsystem/src/main/assets/licenses/*.txt
+scratchpad/
+tmp/
+temp/
+captures/
+
+# ── Hors build : JAMAIS sur GitHub ──
+# Doc, notes, historiques, scripts d'outillage et de build : restent sur le poste.
+/docs/
+/docs-*/
+*.md
+!/README.md
+*.bat
+*.cmd
+*.ps1
+*.psm1
+*.psd1
+*.vbs
+!/agent/installer/install.ps1
+/REPRISE*
+/HANDOFF*
+/PLAN*
+/agent/BUILD_NT6.txt
+# Workstation-only tooling and leftovers (not used by any build)
+/obli.tools
+/agent/agent
+/agent/src/
+/agent/package.json
+/agent/lhm_dlls/
+/server/scripts/
+/mobile/android/cloud-setup.sh
+/mobile/android/RELEASE-FINGERPRINT.txt
+/agent/vmconsole/build.ps1
+/agent/vmconsole/ldd.txt

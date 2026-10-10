@@ -1,0 +1,354 @@
+package main
+
+// command_channel.go — persistent WebSocket "push channel" from server to agent.
+//
+// The agent maintains a long-lived WebSocket to /api/agent/ws.
+// The server uses this channel to deliver commands instantly (e.g.
+// open_remote_tunnel) instead of waiting for the next poll cycle (≤60 s).
+//
+// Protocol (text frames, JSON):
+//
+//   Server → Agent  {"type":"command","id":"...","commandType":"...","payload":{...}}
+//   Agent  → Server {"type":"ack","id":"...","commandType":"...","success":true/false,
+//                    "sessionToken":"...","error":"..."}
+//
+// Auth: standard X-Api-Key header on the WebSocket upgrade request.
+// Reconnect: automatic, with a 10 s back-off.
+
+import (
+	"crypto/tls"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"runtime/debug"
+	"strings"
+	"sync"
+	"time"
+)
+
+// ── Message types ─────────────────────────────────────────────────────────────
+
+type hubCommand struct {
+	Type        string          `json:"type"`
+	ID          string          `json:"id"`
+	CommandType string          `json:"commandType"`
+	Payload     json.RawMessage `json:"payload"`
+}
+
+type hubAck struct {
+	Type         string          `json:"type"`
+	ID           string          `json:"id"`
+	CommandType  string          `json:"commandType"`
+	Success      bool            `json:"success"`
+	Result       json.RawMessage `json:"result,omitempty"`
+	SessionToken string          `json:"sessionToken,omitempty"`
+	Error        string          `json:"error,omitempty"`
+}
+
+// ── Global WS writer ─────────────────────────────────────────────────────────
+// Allows other goroutines (e.g. privacy watcher) to send messages on the
+// command channel when it is connected.
+
+var (
+	cmdChanWs   *wsConn
+	cmdChanMu   sync.Mutex
+)
+
+// errCommandChannelDown: the command channel is not connected.
+var errCommandChannelDown = fmt.Errorf("command channel not connected")
+
+// SendOnCommandChannel sends a JSON text frame on the command channel WS.
+// No-op if the channel is not connected.
+func SendOnCommandChannel(msg interface{}) {
+	_ = sendOnCommandChannelErr(msg)
+}
+
+// sendOnCommandChannelErr sends a JSON text frame on the CURRENT command
+// channel and reports whether it went out (callers fall back to the push).
+func sendOnCommandChannelErr(msg interface{}) error {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	cmdChanMu.Lock()
+	ws := cmdChanWs
+	cmdChanMu.Unlock()
+	if ws == nil {
+		return errCommandChannelDown
+	}
+	return ws.WriteFrame(0x1, data)
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+// runCommandChannel loops forever, reconnecting to the server command channel
+// after each disconnect.  It should be started in a goroutine.
+// tlsInsecureSkipVerify MUST only be true for deployments explicitly configured
+// with a self-signed cert not present in the system trust store.
+// reconnectCommandChannel drops the current channel so the loop redials with
+// the current device ID (identity v2 switch).
+func reconnectCommandChannel() {
+	cmdChanMu.Lock()
+	ws := cmdChanWs
+	cmdChanMu.Unlock()
+	if ws != nil {
+		ws.Close()
+	}
+}
+
+func runCommandChannel(d *CommandDispatcher, serverURL, apiKey string, tlsInsecureSkipVerify bool) {
+	for {
+		code, err := connectCommandChannel(d, serverURL, apiKey, tlsInsecureSkipVerify)
+		// 4004 = "Device not found" — emitted on a fresh install before the
+		// first HTTP push has created the device row. Back off 60s so the
+		// push loop (10–60s cadence) has a chance to register first, rather
+		// than spamming 6 reconnects/min.
+		wait := 10 * time.Second
+		if code == 4004 {
+			wait = 60 * time.Second
+		}
+		if err != nil {
+			log.Printf("[cmd-channel] disconnected: %v — retrying in %s", err, wait)
+		}
+		time.Sleep(wait)
+	}
+}
+
+// connectCommandChannel dials /api/agent/ws, handles incoming commands and
+// returns when the connection is lost. The first return is the WS close
+// code received from the server (0 if none — e.g. network-level failure).
+func connectCommandChannel(d *CommandDispatcher, serverURL, apiKey string, tlsInsecureSkipVerify bool) (uint16, error) {
+	base := strings.TrimRight(serverURL, "/")
+	var wsBase string
+	switch {
+	case strings.HasPrefix(base, "https://"):
+		wsBase = "wss://" + base[8:]
+	case strings.HasPrefix(base, "http://"):
+		wsBase = "ws://" + base[7:]
+	default:
+		wsBase = base
+	}
+	wsURL := wsBase + "/api/agent/ws"
+
+	var tlsCfg *tls.Config
+	if tlsInsecureSkipVerify {
+		tlsCfg = &tls.Config{InsecureSkipVerify: true}
+	}
+
+	wsHeaders := http.Header{
+		"X-Api-Key":     []string{apiKey},
+		"X-Device-UUID": []string{currentDeviceUUID()},
+	}
+	applyIdentityHeaders(wsHeaders)
+	ws, err := wsConnect(wsURL, wsHeaders, tlsCfg)
+	if err != nil {
+		return 0, fmt.Errorf("connect: %w", err)
+	}
+	defer func() {
+		cmdChanMu.Lock()
+		cmdChanWs = nil
+		cmdChanMu.Unlock()
+		ws.Close()
+	}()
+
+	cmdChanMu.Lock()
+	cmdChanWs = ws
+	cmdChanMu.Unlock()
+
+	log.Printf("[cmd-channel] connected to %s", wsURL)
+
+	// Mutex protects concurrent writes from multiple command goroutines.
+	var mu sync.Mutex
+	sendAck := func(a hubAck) {
+		data, err := json.Marshal(a)
+		if err != nil {
+			return
+		}
+		mu.Lock()
+		werr := ws.WriteFrame(0x1, data) // text frame
+		mu.Unlock()
+		if werr == nil {
+			return
+		}
+		// The channel this command came on is gone (a long command — a
+		// 50 MB download — outlived it). The ack must not be lost (the task
+		// would stay "Sent" forever): the CURRENT channel if one is up,
+		// otherwise the next HTTP push, triggered now.
+		if sendOnCommandChannelErr(a) == nil {
+			return
+		}
+		d.addAck(hubAckToCommandAck(a))
+		TriggerImmediatePush()
+	}
+
+	for {
+		opcode, payload, err := ws.ReadFrame()
+		if err != nil {
+			return 0, fmt.Errorf("read: %w", err)
+		}
+
+		switch opcode {
+		case 0x8: // close frame — server asked us to disconnect
+			var code uint16
+			if len(payload) >= 2 {
+				code = uint16(payload[0])<<8 | uint16(payload[1])
+				reason := ""
+				if len(payload) > 2 {
+					reason = string(payload[2:])
+				}
+				log.Printf("[cmd-channel] server closed: code=%d reason=%q", code, reason)
+			} else {
+				log.Printf("[cmd-channel] server closed (no close code)")
+			}
+			return code, nil
+
+		case 0x9: // ping — respond with pong
+			mu.Lock()
+			_ = ws.SendPong(payload)
+			mu.Unlock()
+
+		case 0x1, 0x2: // text or binary — parse as command JSON
+			var msg hubCommand
+			if err := json.Unmarshal(payload, &msg); err != nil {
+				continue
+			}
+			if msg.Type != "command" {
+				continue
+			}
+			// Dispatch each command in its own goroutine so the read loop is
+			// never blocked by a slow operation (e.g. remote tunnel setup).
+			go dispatchHubCommand(d, msg, sendAck)
+		}
+	}
+}
+
+// ── Command dispatch ──────────────────────────────────────────────────────────
+
+func dispatchHubCommand(d *CommandDispatcher, msg hubCommand, sendAck func(hubAck)) {
+	// A panic in one command (e.g. a Win32 proc missing on an old Windows)
+	// must not take the whole agent down: every command runs in its own
+	// goroutine, and an unrecovered panic there kills the process. Answer a
+	// failed ack instead, carrying the session token so a remote session is
+	// failed right away rather than left waiting.
+	acked := false
+	defer func() {
+		r := recover()
+		if r == nil || acked {
+			return
+		}
+		log.Printf("[cmd-channel] command %s (%s) panicked: %v\n%s", msg.ID, msg.CommandType, r, debug.Stack())
+		ack := hubAck{
+			Type:        "ack",
+			ID:          msg.ID,
+			CommandType: msg.CommandType,
+			Success:     false,
+			Error:       fmt.Sprintf("agent internal error: %v", r),
+		}
+		var pm map[string]interface{}
+		if json.Unmarshal(msg.Payload, &pm) == nil {
+			if st, ok := pm["sessionToken"].(string); ok {
+				ack.SessionToken = st
+			}
+		}
+		func() {
+			defer func() { _ = recover() }()
+			sendAck(ack)
+		}()
+	}()
+
+	// Re-use the existing AgentCommand + dispatcher infrastructure.
+	var payloadMap map[string]interface{}
+	if len(msg.Payload) > 0 {
+		_ = json.Unmarshal(msg.Payload, &payloadMap)
+	}
+	if payloadMap == nil {
+		payloadMap = make(map[string]interface{})
+	}
+
+	cmd := AgentCommand{
+		ID:      msg.ID,
+		Type:    msg.CommandType,
+		Payload: payloadMap,
+	}
+
+	var result interface{}
+	var cmdErr error
+	var privacyBlocked bool
+
+	// Privacy mode gate — enforced at the command_channel dispatch layer
+	// so NO command type bypasses it. Must match the check in
+	// executeCommand/ExecuteSync so all paths share one source of truth.
+	if IsPrivacyMode() && isBlockedByPrivacy(msg.CommandType) {
+		token, _ := cmd.Payload["unlockToken"].(string)
+		feature := privacyFeatureForCommand(msg.CommandType)
+		if !CheckUnlockToken(token, feature) {
+			cmdErr = fmt.Errorf("privacy mode is enabled — remote access denied")
+			privacyBlocked = true
+			log.Printf("[cmd-channel] blocked %s (%s) by privacy mode", msg.ID, msg.CommandType)
+		}
+	}
+
+	if !privacyBlocked {
+		switch msg.CommandType {
+		case "open_remote_tunnel":
+			result, cmdErr = d.handleOpenRemoteTunnel(cmd)
+		case "close_remote_tunnel":
+			result, cmdErr = d.handleCloseRemoteTunnel(cmd)
+		case "open_vm_console":
+			result, cmdErr = d.handleOpenVmConsole(cmd)
+		case "close_vm_console":
+			result, cmdErr = d.handleCloseVmConsole(cmd)
+		default:
+			// All other command types are executed synchronously so the
+			// result can be sent back via the WS channel immediately.
+			result, cmdErr = d.ExecuteSync(cmd)
+		}
+	}
+
+	ack := hubAck{
+		Type:        "ack",
+		ID:          msg.ID,
+		CommandType: msg.CommandType,
+		Success:     cmdErr == nil,
+	}
+	if cmdErr != nil {
+		ack.Error = cmdErr.Error()
+		log.Printf("[cmd-channel] command %s (%s) failed: %v", msg.ID, msg.CommandType, cmdErr)
+	} else if result != nil {
+		if data, err := json.Marshal(result); err == nil {
+			ack.Result = json.RawMessage(data)
+		}
+	}
+
+	// Carry the session token in the ack so the server can route it.
+	if st, ok := payloadMap["sessionToken"].(string); ok {
+		ack.SessionToken = st
+	}
+	if ack.SessionToken == "" {
+		if r, ok := result.(map[string]string); ok {
+			ack.SessionToken = r["sessionToken"]
+		}
+	}
+
+	acked = true
+	sendAck(ack)
+}
+
+// hubAckToCommandAck converts a command-channel ack into the push-body ack
+// (same command_queue update server-side).
+func hubAckToCommandAck(a hubAck) CommandAck {
+	ca := CommandAck{CommandID: a.ID, CommandType: a.CommandType, Status: "success"}
+	if !a.Success {
+		ca.Status = "failure"
+		ca.Result = map[string]string{"error": a.Error}
+		return ca
+	}
+	if len(a.Result) > 0 {
+		var v interface{}
+		if json.Unmarshal(a.Result, &v) == nil {
+			ca.Result = v
+		}
+	}
+	return ca
+}

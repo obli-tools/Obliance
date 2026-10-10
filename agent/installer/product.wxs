@@ -1,0 +1,246 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Obliance Agent - Windows MSI Installer
+  Built with WiX v4+ on Windows.
+
+  Prerequisites (one-time setup):
+    dotnet tool install -g wix
+    go install (Go 1.22+, https://go.dev/dl)
+
+  Build (from agent/ directory), driven by the release pipeline: see the
+  build lines below.
+
+  Install command:
+    msiexec /i obliance-agent.msi SERVERURL="https://..." APIKEY="your-key" /quiet
+-->
+<!--
+  Two build lines from this ONE template (same UpgradeCode, service, folder,
+  component GUIDs: an nt6 install upgrades in place like any other version):
+    - modern (default): Go 1.22+ binaries, Windows 10 / Server 2016 or later.
+        wix build installer\_product_versioned.wxs -b . -arch x64 -out dist\obliance-agent.msi
+    - nt6 (-d Nt6=1): Go 1.20 binaries (go120.mod, -X main.buildFlavor=nt6),
+      Windows 7 SP1 / 8.1 / Server 2008 R2 / 2012 / 2012 R2.
+        wix build installer\_product_versioned.wxs -b . -arch x64 -d Nt6=1 -out dist\obliance-agent-nt6.msi
+-->
+<?ifdef Nt6?>
+<?define ProductName = "Obliance Agent (Windows 7 / 8.1 / Server 2008 R2 / 2012)"?>
+<?define AgentExeSrc = "dist\obliance-agent-nt6.exe"?>
+<?define TrayExeSrc = "dist\obliance-tray-nt6.exe"?>
+<?define WatchdogExeSrc = "dist\obliance-watchdog-nt6.exe"?>
+<?else?>
+<?define ProductName = "Obliance Agent"?>
+<?define AgentExeSrc = "dist\obliance-agent.exe"?>
+<?define TrayExeSrc = "dist\obliance-tray.exe"?>
+<?define WatchdogExeSrc = "dist\obliance-watchdog.exe"?>
+<?endif?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="$(var.ProductName)"
+           Manufacturer="Obliance"
+           Version="AGENT_VERSION_PLACEHOLDER"
+           Language="1033"
+           UpgradeCode="B5C6D7E8-F9A0-1234-BCDE-F01234567891">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Obliance Agent is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+<?ifndef Nt6?>
+    <!--
+      Modern MSI = Windows 10 / Server 2016 or later only: its Go 1.22+
+      binaries die before main() on Windows 7 / 2008 R2 and are unsupported
+      on 8.1 / 2012 / 2012 R2.
+      VersionNT cannot tell Windows 10 from 8.1: Windows Installer reports
+      VersionNT = 603 on BOTH (msiexec is not manifested for Windows 10).
+      Two independent Windows-10-only signals instead:
+        - CurrentMajorVersionNumber under HKLM\SOFTWARE\Microsoft\Windows NT\
+          CurrentVersion: the value exists from Windows 10 / Server 2016 on
+          (REG_DWORD 10, read raw as "#10"), never on 8.1 / 2012 R2 or older;
+        - WindowsBuild >= 10240 (first Windows 10 build; 8.1 / 2012 R2 = 9600).
+      "Installed" keeps repair / uninstall possible on any system.
+    -->
+    <Property Id="WINCURRENTMAJOR">
+      <RegistrySearch Id="WinCurrentMajorSearch" Root="HKLM"
+                      Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+                      Name="CurrentMajorVersionNumber" Type="raw" Bitness="always64" />
+    </Property>
+    <Launch Condition="Installed OR WINCURRENTMAJOR OR (WindowsBuild &gt;= 10240)"
+            Message="This Obliance Agent package requires Windows 10 / Windows Server 2016 or later. For Windows 7 SP1, Windows 8.1, Windows Server 2008 R2, 2012 and 2012 R2 install obliance-agent-nt6.msi." />
+<?else?>
+    <!-- nt6 MSI: Windows 7 SP1 / Server 2008 R2 SP1 (VersionNT 601) or later. -->
+    <Launch Condition="Installed OR (VersionNT &gt; 601) OR (VersionNT = 601 AND ServicePackLevel &gt;= 1)"
+            Message="This Obliance Agent package requires Windows 7 SP1 / Windows Server 2008 R2 SP1 or later." />
+<?endif?>
+
+    <!--
+      Disable the Windows Restart Manager to prevent "FilesInUse" dialogs listing
+      leftover processes (e.g. ObliviewAgent / Obliview.exe from a previous installation).
+      Service lifecycle is fully handled by our ServiceControl and CustomAction elements.
+    -->
+    <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
+
+    <!-- Properties passed via: msiexec /i ... SERVERURL="..." APIKEY="..." -->
+    <Property Id="SERVERURL" Secure="yes" />
+    <!-- Hidden: never written to msiexec logs (/l*v). -->
+    <Property Id="APIKEY" Secure="yes" Hidden="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="OblianceAgent">
+
+        <!--
+          The Go binary is a proper Windows service executable.
+          It calls SetServiceStatus(SERVICE_RUNNING) via golang.org/x/sys/windows/svc,
+          so the MSI Wait="yes" (default) resolves normally without hanging.
+          The url and key flags are passed as service arguments; on first run the
+          agent writes config.json and from then on reads that file directly.
+        -->
+        <Component Id="AgentExe" Guid="A1B2C3D4-E5F6-7890-ABCD-EF1234560001">
+          <!--
+            DefaultVersion forces MSI to always overwrite the exe even when the binary on disk
+            has no Win32 version resource (Go binaries are unversioned by default).
+            Without this, MSI may skip the copy if it finds an "unversioned but modified" file
+            on disk (e.g. leftover from a failed previous install), leaving the wrong binary in place.
+            65535.0.0.0 is always greater than any real version, so the source file always wins.
+          -->
+          <File Id="AgentExeFile" Source="$(var.AgentExeSrc)" Name="obliance-agent.exe"
+                DefaultVersion="65535.0.0.0" />
+          <ServiceInstall Id="AgentSvc"
+                          Name="OblianceAgent"
+                          DisplayName="Obliance Monitoring Agent"
+                          Description="Sends system metrics to the Obliance monitoring platform."
+                          Start="auto"
+                          Type="ownProcess"
+                          Account="LocalSystem"
+                          ErrorControl="normal" />
+          <!--
+            No Arguments here — the agent bootstraps from the registry values
+            written below (HKLM\SOFTWARE\OblianceAgent) on first run, then
+            persists them to config.json.  Storing the URL in service arguments
+            caused http:// to be frozen in SCM across upgrades.
+          -->
+          <ServiceControl Id="AgentSvcStart" Name="OblianceAgent" Start="install" />
+          <ServiceControl Id="AgentSvcStop"  Name="OblianceAgent" Stop="both" Remove="uninstall" Wait="yes" />
+        </Component>
+
+        <!--
+          Registry fallback: agent reads these on first run if config.json is absent
+          and the service arguments are not yet parsed (edge cases).
+          Written to 64-bit hive via -arch x64 build flag.
+        -->
+        <Component Id="AgentConfig" Guid="B2C3D4E5-F6A7-8901-BCDE-EF1234560002">
+          <!--
+            The key holds the tenant API key: protected DACL, SYSTEM +
+            Administrators only (HKLM\SOFTWARE is readable by Users by
+            default). The agent re-applies the same DACL at every start
+            (secretfile_windows.go protectAgentRegistryKey).
+          -->
+          <RegistryKey Root="HKLM" Key="SOFTWARE\OblianceAgent" ForceCreateOnInstall="yes">
+            <PermissionEx Sddl="D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)" />
+            <RegistryValue Name="ServerUrl" Type="string" Value="[SERVERURL]" KeyPath="yes" />
+            <RegistryValue Name="ApiKey"    Type="string" Value="[APIKEY]" />
+          </RegistryKey>
+        </Component>
+
+        <!--
+          Tray icon process — runs in user session at login.
+          Uses -H windowsgui so no console window appears.
+          Communicates with the agent service via shared privacy.json file.
+        -->
+        <Component Id="TrayExe" Guid="C3D4E5F6-A7B8-9012-CDEF-012345670003">
+          <File Id="TrayExeFile" Source="$(var.TrayExeSrc)" Name="obliance-tray.exe"
+                DefaultVersion="65535.0.0.0" />
+          <RegistryValue Root="HKLM"
+                         Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+                         Name="OblianceTray"
+                         Type="string"
+                         Value="[INSTALLFOLDER]obliance-tray.exe"
+                         KeyPath="yes" />
+        </Component>
+
+        <!--
+          Safe Mode with Networking support: registering the service under
+          SafeBoot\Network\OblianceAgent makes Windows start it when the host
+          boots into Safe Mode with Networking. The default REG_SZ "Service"
+          is the magic value Windows expects. The agent also writes this key
+          on every service start (ensureSafeBootRegistration) so existing
+          deployments get the support without a fresh MSI install — the
+          Component is here so MSI ownership of the key is correct and uninstall
+          removes it cleanly.
+        -->
+        <Component Id="AgentSafeBoot" Guid="E5F6A7B8-C9D0-1234-EF01-234567890005">
+          <RegistryValue Root="HKLM"
+                         Key="SYSTEM\CurrentControlSet\Control\SafeBoot\Network\OblianceAgent"
+                         Type="string"
+                         Value="Service"
+                         KeyPath="yes" />
+        </Component>
+
+        <!--
+          Watchdog sentinel — runs every 5 minutes as SYSTEM via a Scheduled Task.
+          Restarts the OblianceAgent service if it stopped unexpectedly, and
+          records restarts to watchdog.json for the agent to report on next push.
+          The agent honours a watchdog.json "inhibitUntil" flag during auto-update
+          so msiexec's stop/start cycle is not disturbed.
+        -->
+        <Component Id="WatchdogExe" Guid="D4E5F6A7-B8C9-0123-DEF0-123456780004">
+          <File Id="WatchdogExeFile" Source="$(var.WatchdogExeSrc)" Name="obliance-watchdog.exe"
+                DefaultVersion="65535.0.0.0" KeyPath="yes" />
+        </Component>
+
+      </Directory>
+    </StandardDirectory>
+
+    <!-- Kill tray before install so the exe is not locked -->
+    <SetProperty Id="KillTrayProp" Value="[SystemFolder]cmd.exe" Sequence="execute" Before="KillTray" />
+    <CustomAction Id="KillTray"
+                  Property="KillTrayProp"
+                  ExeCommand="/C taskkill /F /IM obliance-tray.exe"
+                  Execute="immediate"
+                  Return="ignore" />
+
+    <!-- Configure service failure recovery: restart after 30s, 60s, then 120s -->
+    <SetProperty Id="SvcFailureProp" Value="[SystemFolder]cmd.exe" Sequence="execute" Before="SvcFailure" />
+    <CustomAction Id="SvcFailure"
+                  Property="SvcFailureProp"
+                  ExeCommand="/C sc failure OblianceAgent reset=86400 actions=restart/30000/restart/60000/restart/120000"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <!--
+      Scheduled Task: obliance-watchdog runs every 5 minutes as SYSTEM.
+      Created on install, removed on uninstall. If the task is deleted by
+      hand, the agent recreates it at startup (see main.go ensureWatchdogTask).
+    -->
+    <SetProperty Id="WdCreateProp" Value="[SystemFolder]cmd.exe" Sequence="execute" Before="WdCreate" />
+    <CustomAction Id="WdCreate"
+                  Property="WdCreateProp"
+                  ExeCommand="/C schtasks /Create /TN &quot;OblianceWatchdog&quot; /TR &quot;\&quot;[INSTALLFOLDER]obliance-watchdog.exe\&quot;&quot; /SC MINUTE /MO 5 /RU SYSTEM /RL HIGHEST /F"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <SetProperty Id="WdDeleteProp" Value="[SystemFolder]cmd.exe" Sequence="execute" Before="WdDelete" />
+    <CustomAction Id="WdDelete"
+                  Property="WdDeleteProp"
+                  ExeCommand="/C schtasks /Delete /TN &quot;OblianceWatchdog&quot; /F"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="KillTray" Before="InstallFiles" />
+      <Custom Action="SvcFailure" After="StartServices" />
+      <Custom Action="WdCreate" After="SvcFailure" Condition="NOT Installed OR REINSTALL" />
+      <Custom Action="WdDelete" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+    <!-- Tray relaunch is handled by the agent service (watchTrayLoop) after it starts -->
+
+    <Feature Id="Main">
+      <ComponentRef Id="AgentExe" />
+      <ComponentRef Id="AgentConfig" />
+      <ComponentRef Id="AgentSafeBoot" />
+      <ComponentRef Id="TrayExe" />
+      <ComponentRef Id="WatchdogExe" />
+    </Feature>
+
+  </Package>
+</Wix>

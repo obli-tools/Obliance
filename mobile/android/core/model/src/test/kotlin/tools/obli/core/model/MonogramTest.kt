@@ -1,0 +1,47 @@
+package tools.obli.core.model
+
+import kotlinx.serialization.json.Json
+import org.junit.Assert.assertEquals
+import org.junit.Test
+
+class MonogramTest {
+    @Test fun twoWords() = assertEquals("OQ", Monogram.of("Obliance Qual"))
+    @Test fun camelCase() = assertEquals("OP", Monogram.of("ObliProd"))
+    @Test fun oneWord() = assertEquals("OD", Monogram.of("Obliance Dev"))
+    @Test fun punctuationAndCase() = assertEquals("RV", Monogram.of("  rmm.votre-msp "))
+    @Test fun accents() = assertEquals("ÉC", Monogram.of("école centrale"))
+    @Test fun nothingUsable() = assertEquals("?", Monogram.of(" -- "))
+    @Test fun singleLetter() = assertEquals("X", Monogram.of("x"))
+
+    // Proof for phase 0: the kotlinx.serialization compiler plugin works with
+    // AGP 9 built-in Kotlin 2.2.10 (value class + enums + defaults round-trip).
+    @Test fun serializationPluginRoundTrip() {
+        val p = ServerProfile(
+            id = ServerId("7f1c"), origin = "https://obliance-dev.example.org", displayName = "Obliance Dev",
+            color = ServerColor.TEAL, monogram = "OD", order = 1,
+        )
+        val json = Json.encodeToString(ServerProfile.serializer(), p)
+        assertEquals(p, Json.decodeFromString(ServerProfile.serializer(), json))
+        assertEquals(true, json.contains("\"id\":\"7f1c\""))
+    }
+}
+
+class ObliUserThemeTest {
+    private val json = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+    private fun user(prefs: String) = json.decodeFromString(ObliUser.serializer(), """{"id":3,"username":"og_john.smith","preferences":$prefs}""")
+
+    @Test fun themeFromObject() = assertEquals("neon", user("""{"preferredTheme":"neon","toastEnabled":true}""").preferredTheme)
+    @Test fun themeFromJsonString() = assertEquals("modern", user("\"{\\\"preferredTheme\\\":\\\"modern\\\"}\"").preferredTheme)
+    @Test fun dimAndUnknownIdsPassThrough() {
+        // Raw id, no whitelist here: `obli-dim` (and any newer theme) reaches the design-system mapping intact.
+        assertEquals("obli-dim", user("""{"preferredTheme":"obli-dim"}""").preferredTheme)
+        assertEquals("obli-some-future-theme", user("""{"preferredTheme":"obli-some-future-theme"}""").preferredTheme)
+    }
+    @Test fun noOrOddPreferences() {
+        assertEquals(null, user("null").preferredTheme)
+        assertEquals(null, user("{}").preferredTheme)
+        assertEquals(null, user("\"not json\"").preferredTheme)
+        assertEquals(null, user("""{"preferredTheme":42}""").preferredTheme)
+        assertEquals(null, json.decodeFromString(ObliUser.serializer(), """{"id":1,"username":"a"}""").preferredTheme)
+    }
+}

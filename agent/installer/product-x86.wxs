@@ -1,0 +1,180 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Obliance Agent — Windows 32-bit (x86) MSI Installer.
+
+  SEPARATE, ISOLATED twin of product.wxs (the x64 installer). It exists so 32-bit
+  Windows (Win7/Win10 x86) gets the SAME modern agent with full feature parity
+  (service, tray, watchdog scheduled task, safe-mode, service recovery, registry
+  bootstrap). The ONLY differences from product.wxs are:
+    - a distinct UpgradeCode + distinct component GUIDs (so the two MSIs never
+      collide / are tracked as different products),
+    - ProgramFilesFolder instead of ProgramFiles64Folder (32-bit install dir),
+    - the File Source paths point at the windows/386 binaries (…-x86).
+  The installed file NAMES stay identical (obliance-agent.exe, etc.) so the
+  agent's own paths and the service name are unchanged.
+
+  Build (from agent/ directory), driven by the release pipeline:
+    wix build installer\product-x86.wxs -b . -arch x86 -out dist\obliance-agent-x86.msi
+-->
+<!--
+  Two build lines from this ONE template (same UpgradeCode / service / folder):
+    - modern (default): Go 1.22+ x86 binaries, Windows 10 or later.
+    - nt6 (-d Nt6=1): Go 1.20 x86 binaries (go120.mod, -X main.buildFlavor=nt6),
+      Windows 7 SP1 / 8.1 32-bit.
+        wix build installer\_product_x86_versioned.wxs -b . -arch x86 -d Nt6=1 -out dist\obliance-agent-nt6-x86.msi
+-->
+<?ifdef Nt6?>
+<?define ProductName = "Obliance Agent (32-bit, Windows 7 / 8.1)"?>
+<?define AgentExeSrc = "dist\obliance-agent-nt6-x86.exe"?>
+<?define TrayExeSrc = "dist\obliance-tray-nt6-x86.exe"?>
+<?define WatchdogExeSrc = "dist\obliance-watchdog-nt6-x86.exe"?>
+<?else?>
+<?define ProductName = "Obliance Agent (32-bit)"?>
+<?define AgentExeSrc = "dist\obliance-agent-x86.exe"?>
+<?define TrayExeSrc = "dist\obliance-tray-x86.exe"?>
+<?define WatchdogExeSrc = "dist\obliance-watchdog-x86.exe"?>
+<?endif?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="$(var.ProductName)"
+           Manufacturer="Obliance"
+           Version="AGENT_VERSION_PLACEHOLDER"
+           Language="1033"
+           UpgradeCode="7E1A2B3C-4D5E-6F70-8192-A3B4C5D6E7F8">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Obliance Agent is already installed." />
+
+<?ifndef Nt6?>
+    <!--
+      Modern MSI = Windows 10 or later only (see product.wxs: VersionNT is 603
+      on both 8.1 and 10, so VersionNT cannot be used). CurrentMajorVersionNumber
+      exists from Windows 10 on (a 32-bit package reads the 32-bit registry
+      view, where Windows 10 x64 mirrors this value too). WindowsBuild >= 10240
+      is the second, independent signal.
+    -->
+    <Property Id="WINCURRENTMAJOR">
+      <RegistrySearch Id="WinCurrentMajorSearch32" Root="HKLM"
+                      Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+                      Name="CurrentMajorVersionNumber" Type="raw" />
+    </Property>
+    <Launch Condition="Installed OR WINCURRENTMAJOR OR (WindowsBuild &gt;= 10240)"
+            Message="This Obliance Agent package requires Windows 10 or later. For Windows 7 SP1 and Windows 8.1 install obliance-agent-nt6-x86.msi." />
+<?else?>
+    <Launch Condition="Installed OR (VersionNT &gt; 601) OR (VersionNT = 601 AND ServicePackLevel &gt;= 1)"
+            Message="This Obliance Agent package requires Windows 7 SP1 or later." />
+<?endif?>
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
+
+    <!-- Properties passed via: msiexec /i ... SERVERURL="..." APIKEY="..." -->
+    <Property Id="SERVERURL" Secure="yes" />
+    <!-- Hidden: never written to msiexec logs (/l*v). -->
+    <Property Id="APIKEY" Secure="yes" Hidden="yes" />
+
+    <!-- 32-bit install dir (no ProgramFiles64Folder on x86 Windows). -->
+    <StandardDirectory Id="ProgramFilesFolder">
+      <Directory Id="INSTALLFOLDER" Name="OblianceAgent">
+
+        <Component Id="AgentExe" Guid="7E1A2B3C-4D5E-6F70-8192-A3B4C5D60001">
+          <File Id="AgentExeFile" Source="$(var.AgentExeSrc)" Name="obliance-agent.exe"
+                DefaultVersion="65535.0.0.0" />
+          <ServiceInstall Id="AgentSvc"
+                          Name="OblianceAgent"
+                          DisplayName="Obliance Monitoring Agent"
+                          Description="Sends system metrics to the Obliance monitoring platform."
+                          Start="auto"
+                          Type="ownProcess"
+                          Account="LocalSystem"
+                          ErrorControl="normal" />
+          <ServiceControl Id="AgentSvcStart" Name="OblianceAgent" Start="install" />
+          <ServiceControl Id="AgentSvcStop"  Name="OblianceAgent" Stop="both" Remove="uninstall" Wait="yes" />
+        </Component>
+
+        <!-- Registry fallback (32-bit hive on x86 Windows via -arch x86). -->
+        <Component Id="AgentConfig" Guid="7E1A2B3C-4D5E-6F70-8192-A3B4C5D60002">
+          <!-- API key: protected DACL, SYSTEM + Administrators only (see product.wxs). -->
+          <RegistryKey Root="HKLM" Key="SOFTWARE\OblianceAgent" ForceCreateOnInstall="yes">
+            <PermissionEx Sddl="D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)" />
+            <RegistryValue Name="ServerUrl" Type="string" Value="[SERVERURL]" KeyPath="yes" />
+            <RegistryValue Name="ApiKey"    Type="string" Value="[APIKEY]" />
+          </RegistryKey>
+        </Component>
+
+        <Component Id="TrayExe" Guid="7E1A2B3C-4D5E-6F70-8192-A3B4C5D60003">
+          <File Id="TrayExeFile" Source="$(var.TrayExeSrc)" Name="obliance-tray.exe"
+                DefaultVersion="65535.0.0.0" />
+          <RegistryValue Root="HKLM"
+                         Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+                         Name="OblianceTray"
+                         Type="string"
+                         Value="[INSTALLFOLDER]obliance-tray.exe"
+                         KeyPath="yes" />
+        </Component>
+
+        <Component Id="AgentSafeBoot" Guid="7E1A2B3C-4D5E-6F70-8192-A3B4C5D60005">
+          <RegistryValue Root="HKLM"
+                         Key="SYSTEM\CurrentControlSet\Control\SafeBoot\Network\OblianceAgent"
+                         Type="string"
+                         Value="Service"
+                         KeyPath="yes" />
+        </Component>
+
+        <Component Id="WatchdogExe" Guid="7E1A2B3C-4D5E-6F70-8192-A3B4C5D60004">
+          <File Id="WatchdogExeFile" Source="$(var.WatchdogExeSrc)" Name="obliance-watchdog.exe"
+                DefaultVersion="65535.0.0.0" KeyPath="yes" />
+        </Component>
+
+      </Directory>
+    </StandardDirectory>
+
+    <!-- Kill tray before install so the exe is not locked -->
+    <SetProperty Id="KillTrayProp" Value="[SystemFolder]cmd.exe" Sequence="execute" Before="KillTray" />
+    <CustomAction Id="KillTray"
+                  Property="KillTrayProp"
+                  ExeCommand="/C taskkill /F /IM obliance-tray.exe"
+                  Execute="immediate"
+                  Return="ignore" />
+
+    <!-- Configure service failure recovery: restart after 30s, 60s, then 120s -->
+    <SetProperty Id="SvcFailureProp" Value="[SystemFolder]cmd.exe" Sequence="execute" Before="SvcFailure" />
+    <CustomAction Id="SvcFailure"
+                  Property="SvcFailureProp"
+                  ExeCommand="/C sc failure OblianceAgent reset=86400 actions=restart/30000/restart/60000/restart/120000"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <!-- Scheduled Task: obliance-watchdog runs every 5 minutes as SYSTEM. -->
+    <SetProperty Id="WdCreateProp" Value="[SystemFolder]cmd.exe" Sequence="execute" Before="WdCreate" />
+    <CustomAction Id="WdCreate"
+                  Property="WdCreateProp"
+                  ExeCommand="/C schtasks /Create /TN &quot;OblianceWatchdog&quot; /TR &quot;\&quot;[INSTALLFOLDER]obliance-watchdog.exe\&quot;&quot; /SC MINUTE /MO 5 /RU SYSTEM /RL HIGHEST /F"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <SetProperty Id="WdDeleteProp" Value="[SystemFolder]cmd.exe" Sequence="execute" Before="WdDelete" />
+    <CustomAction Id="WdDelete"
+                  Property="WdDeleteProp"
+                  ExeCommand="/C schtasks /Delete /TN &quot;OblianceWatchdog&quot; /F"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="KillTray" Before="InstallFiles" />
+      <Custom Action="SvcFailure" After="StartServices" />
+      <Custom Action="WdCreate" After="SvcFailure" Condition="NOT Installed OR REINSTALL" />
+      <Custom Action="WdDelete" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+
+    <Feature Id="Main">
+      <ComponentRef Id="AgentExe" />
+      <ComponentRef Id="AgentConfig" />
+      <ComponentRef Id="AgentSafeBoot" />
+      <ComponentRef Id="TrayExe" />
+      <ComponentRef Id="WatchdogExe" />
+    </Feature>
+
+  </Package>
+</Wix>

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Profil et sécurité, enrôlement d'un compte Obligate (clés SSO). -->
+<resources>
+    <string name="more_devkey_enrol_ask_sso">Pour activer, reconfirmez votre identité auprès d\'Obligate.</string>
+    <string name="more_devkey_enrol_sso_hint">Obligate demande votre mot de passe et un code, même avec une session Obligate déjà ouverte. L\'empreinte est demandée juste après.</string>
+    <string name="more_devkey_reauth">Reconfirmer avec Obligate</string>
+    <string name="more_devkey_busy_sso">Reconfirmation auprès d\'Obligate, puis empreinte…</string>
+    <string name="more_devkey_problem_reauth_required">La reconfirmation Obligate a expiré ou votre compte Obligate a changé. Reconfirmez.</string>
+    <string name="more_devkey_problem_reauth_failed">La reconfirmation auprès d\'Obligate n\'a pas abouti. Réessayez.</string>
+    <string name="more_devkey_problem_reauth_no_otp">Activez d\'abord la double authentification dans votre compte Obligate : la reconfirmation demande votre mot de passe et un code.</string>
+    <string name="more_devkey_problem_reauth_final">La reconfirmation auprès d\'Obligate n\'est pas possible pour le moment, pour la raison indiquée dans la fenêtre Obligate. Un nouvel essai n\'y changera rien : contactez un administrateur si cela persiste.</string>
+    <string name="more_devkey_problem_verifier_unavailable">La vérification Obligate est momentanément indisponible. Réessayez dans un instant.</string>
+</resources>

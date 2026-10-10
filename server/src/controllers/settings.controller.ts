@@ -1,0 +1,148 @@
+import type { Request, Response, NextFunction } from 'express';
+import { settingsService } from '../services/settings.service';
+import type { SettingScope } from '@obliance/shared';
+import type { SettingKey } from '@obliance/shared';
+import { AppError } from '../middleware/errorHandler';
+import type { SetSettingInput, SetSettingsBulkInput } from '../validators/settings.schema';
+
+function parseScope(req: Request): { scope: SettingScope; scopeId: number | null } {
+  const { scope, scopeId } = req.params;
+
+  if (scope === 'global') return { scope: 'global', scopeId: null };
+  if (scope === 'group' || scope === 'device') {
+    const id = parseInt(scopeId, 10);
+    if (isNaN(id)) throw new AppError(400, 'Invalid scope ID');
+    return { scope, scopeId: id };
+  }
+  throw new AppError(400, 'Invalid scope. Must be global, group, or device');
+}
+
+/** A group / device scope names a group / device of the request's tenant:
+ *  settings rows are stored per tenant, and resolving another tenant's group
+ *  returned the names of its ancestors. */
+async function assertScopeInTenant(req: Request, scope: SettingScope, scopeId: number | null): Promise<void> {
+  if (scope === 'global' || scopeId === null) return;
+  const { db } = await import('../db');
+  const table = scope === 'group' ? 'device_groups' : 'devices';
+  const row = await db(table).where({ id: scopeId, tenant_id: req.tenantId! }).first('id');
+  if (!row) throw new AppError(404, scope === 'group' ? 'Group not found' : 'Device not found');
+}
+
+export const settingsController = {
+  // GET /api/settings/global/resolved
+  async getGlobalResolved(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const result = await settingsService.resolveGlobal(req.tenantId!);
+      res.json({ success: true, data: result });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  // GET /api/settings/group/:scopeId/resolved
+  async getGroupResolved(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const groupId = parseInt(req.params.scopeId, 10);
+      if (isNaN(groupId)) throw new AppError(400, 'Invalid group ID');
+      await assertScopeInTenant(req, 'group', groupId);
+      const result = await settingsService.resolveForGroup(req.tenantId!, groupId);
+      res.json({ success: true, data: result });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  // GET /api/settings/device/:scopeId/resolved
+  async getDeviceResolved(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const deviceId = parseInt(req.params.scopeId, 10);
+      if (isNaN(deviceId)) throw new AppError(400, 'Invalid device ID');
+
+      // Need the device's group_id
+      const { db: database } = await import('../db');
+      const device = await database('devices').where({ id: deviceId, tenant_id: req.tenantId! }).first();
+      if (!device) throw new AppError(404, 'Device not found');
+
+      const resolved = await settingsService.resolveForDevice(req.tenantId!, deviceId, device.group_id);
+
+      // Also get device-level overrides specifically
+      const overrides = await settingsService.getByScope(req.tenantId!, 'device', deviceId);
+
+      res.json({ success: true, data: { resolved, overrides } });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  // PUT /api/settings/:scope/:scopeId
+  async set(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const { scope, scopeId } = parseScope(req);
+      await assertScopeInTenant(req, scope, scopeId);
+      const { key, value } = req.body as SetSettingInput;
+
+      await settingsService.set(req.tenantId!, scope, scopeId, key as SettingKey, value);
+
+      // Broadcast settings update
+      const io = req.app.get('io');
+      if (io) {
+        io.to('role:admin').emit('settings:updated', { scope, scopeId, key, value });
+      }
+
+      res.json({ success: true, message: 'Setting saved' });
+    } catch (err: unknown) {
+      if (err instanceof Error && (err.message.includes('must be between') || err.message.includes('Unknown setting'))) {
+        next(new AppError(400, err.message));
+      } else {
+        next(err);
+      }
+    }
+  },
+
+  // PUT /api/settings/:scope/:scopeId/bulk
+  async setBulk(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const { scope, scopeId } = parseScope(req);
+      await assertScopeInTenant(req, scope, scopeId);
+      const { overrides } = req.body as SetSettingsBulkInput;
+
+      await settingsService.setBulk(
+        req.tenantId!,
+        scope,
+        scopeId,
+        overrides.map((o) => ({ key: o.key as SettingKey, value: o.value })),
+      );
+
+      const io = req.app.get('io');
+      if (io) {
+        io.to('role:admin').emit('settings:updated', { scope, scopeId, overrides });
+      }
+
+      res.json({ success: true, message: 'Settings saved' });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  // DELETE /api/settings/:scope/:scopeId/:key  (reset to inherited)
+  async remove(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const { scope, scopeId } = parseScope(req);
+      await assertScopeInTenant(req, scope, scopeId);
+      const { key } = req.params;
+
+      const deleted = await settingsService.remove(req.tenantId!, scope, scopeId, key as SettingKey);
+
+      if (deleted) {
+        const io = req.app.get('io');
+        if (io) {
+          io.to('role:admin').emit('settings:updated', { scope, scopeId, key, removed: true });
+        }
+      }
+
+      res.json({ success: true, message: deleted ? 'Setting reset to inherited' : 'No override found' });
+    } catch (err) {
+      next(err);
+    }
+  },
+};

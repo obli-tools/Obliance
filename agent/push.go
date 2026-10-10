@@ -1,0 +1,429 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"log"
+	"net/http"
+	"os"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+)
+
+// ── Agent events ─────────────────────────────────────────────────────────────
+
+// AgentEvent represents a discrete event reported to the server (e.g. boot, login).
+type AgentEvent struct {
+	Type      string                 `json:"type"`
+	Timestamp string                 `json:"timestamp"`
+	Data      map[string]interface{} `json:"data,omitempty"`
+}
+
+var (
+	pendingEvents   []AgentEvent
+	pendingEventsMu sync.Mutex
+)
+
+func addEvent(eventType string, data map[string]interface{}) {
+	pendingEventsMu.Lock()
+	defer pendingEventsMu.Unlock()
+	pendingEvents = append(pendingEvents, AgentEvent{
+		Type:      eventType,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Data:      data,
+	})
+}
+
+func drainEvents() []AgentEvent {
+	pendingEventsMu.Lock()
+	defer pendingEventsMu.Unlock()
+	if len(pendingEvents) == 0 {
+		return nil
+	}
+	events := make([]AgentEvent, len(pendingEvents))
+	copy(events, pendingEvents)
+	pendingEvents = pendingEvents[:0]
+	return events
+}
+
+// ── Push request / response types ─────────────────────────────────────────────
+
+type pushBody struct {
+	DeviceUUID       string       `json:"deviceUuid"`
+	Hostname         string       `json:"hostname"`
+	AgentVersion     string       `json:"agentVersion"`
+	OSInfo           OSInfo       `json:"osInfo"`
+	Metrics          Metrics      `json:"metrics"`
+	Acks             []CommandAck `json:"acks,omitempty"`
+	IPLocal          string       `json:"ipLocal,omitempty"`
+	MACAddress       string       `json:"macAddress,omitempty"`
+	PrivacyMode      bool         `json:"privacyMode"`
+	AirgapMode       bool         `json:"airgapMode"`
+	LastLoggedInUser string       `json:"lastLoggedInUser,omitempty"`
+	DistroFamily     string       `json:"distroFamily,omitempty"`
+	// AgentFlavor is always "modern" for this code base (the nt6 build
+	// included): "legacy" is reserved to the reduced Go 1.20 agent in
+	// cmd/legacy, for which the server disables most features.
+	AgentFlavor string `json:"agentFlavor"`
+	// AgentBuild tells the Windows build lines apart: "modern" (Go 1.22+,
+	// Windows 10 / Server 2016+, macOS, Linux) or "nt6" (Go 1.20, Windows 7
+	// SP1 / 8.1 / Server 2008 R2 / 2012 / 2012 R2). See build_flavor.go.
+	AgentBuild string `json:"agentBuild"`
+	// PSVersion is the Windows PowerShell version, probed once in the
+	// background ("2.0", "5.1.17763.1", ...); "" until known / not Windows.
+	PSVersion             string       `json:"psVersion,omitempty"`
+	Events                []AgentEvent `json:"events,omitempty"`
+	WatchdogRestartCount  int          `json:"watchdogRestartCount,omitempty"`
+	WatchdogLastRestartAt string       `json:"watchdogLastRestartAt,omitempty"`
+	// Virtualization host type detected on this machine ("hyperv" today),
+	// or "" when the host runs no recognised hypervisor role. Cheap +
+	// cached, so safe to send on every push.
+	VirtualizationHost string `json:"virtualizationHost,omitempty"`
+	// Backup host type detected on this machine ("veeam" today), or "" when
+	// the host runs no recognised backup-server role. Cheap + cached.
+	BackupHost string `json:"backupHost,omitempty"`
+	// ObliReach auto-install status (oblireach_manager.go). Omitted until
+	// the manager has run with a target sent by the server.
+	Oblireach *ObliReachReport `json:"oblireach,omitempty"`
+	// Prereqs: Windows NT 6.x prerequisites (SP1, SHA-2 signing, KB2533623,
+	// TLS 1.2 Schannel, WMF, .NET 4.x) — prereqs.go. Omitted on Windows 10+
+	// and other OSes.
+	Prereqs *NT6Prereqs `json:"prereqs,omitempty"`
+	// VmConsole: Hyper-V VM console helper bundle state (vmconsole_*.go).
+	// Omitted on hosts without the Hyper-V role.
+	VmConsole *VmConsoleReport `json:"vmConsole,omitempty"`
+}
+
+// AgentCommand is a command delivered from the server in a push response.
+type AgentCommand struct {
+	ID       string                 `json:"id"`
+	Type     string                 `json:"type"`
+	Payload  map[string]interface{} `json:"payload,omitempty"`
+	Priority string                 `json:"priority,omitempty"`
+}
+
+type pushResponse struct {
+	Status        string `json:"status"`
+	LatestVersion string `json:"latestVersion,omitempty"` // piggybacked version info
+	Config        *struct {
+		CheckIntervalSeconds     int   `json:"checkIntervalSeconds"`
+		PushIntervalSeconds      int   `json:"pushIntervalSeconds"`
+		ScanIntervalSeconds      int   `json:"scanIntervalSeconds"`
+		TaskRetrieveDelaySeconds int   `json:"taskRetrieveDelaySeconds"`
+		RemediationEnabled       *bool `json:"remediationEnabled,omitempty"`
+	} `json:"config,omitempty"`
+	Commands   []AgentCommand `json:"commands,omitempty"`
+	NextPollIn int            `json:"nextPollIn,omitempty"` // seconds
+	// Legacy one-shot command field — kept for backward compatibility.
+	Command string `json:"command,omitempty"`
+	// ObliReach version this server ships for this device (absent on older
+	// servers, pending/legacy devices, or when no version file exists).
+	Oblireach *ObliReachDesired `json:"oblireach,omitempty"`
+}
+
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
+// ── Distro family detection ──────────────────────────────────────────────────
+
+var (
+	cachedDistroFamily string
+	distroFamilyOnce   sync.Once
+)
+
+// getDistroFamily returns a normalized distribution family string.
+// The value is computed once and cached for the lifetime of the process.
+func getDistroFamily() string {
+	distroFamilyOnce.Do(func() {
+		cachedDistroFamily = detectDistroFamily()
+	})
+	return cachedDistroFamily
+}
+
+func detectDistroFamily() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "windows"
+	case "darwin":
+		return "macos"
+	case "freebsd":
+		return "freebsd"
+	case "linux":
+		return detectLinuxDistroFamily()
+	default:
+		return runtime.GOOS
+	}
+}
+
+func detectLinuxDistroFamily() string {
+	f, err := os.Open("/etc/os-release")
+	if err != nil {
+		return "linux"
+	}
+	defer f.Close()
+
+	var distroID string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "ID=") {
+			distroID = strings.Trim(strings.TrimPrefix(line, "ID="), "\"")
+			break
+		}
+	}
+	if distroID == "" {
+		return "linux"
+	}
+
+	// Map known distro IDs to normalized families.
+	familyMap := map[string]string{
+		"ubuntu":              "debian",
+		"debian":              "debian",
+		"linuxmint":           "debian",
+		"pop":                 "debian",
+		"elementary":          "debian",
+		"raspbian":            "debian",
+		"centos":              "rhel",
+		"rhel":                "rhel",
+		"rocky":               "rhel",
+		"alma":                "rhel",
+		"oracle":              "rhel",
+		"fedora":              "fedora",
+		"arch":                "arch",
+		"manjaro":             "arch",
+		"endeavouros":         "arch",
+		"opensuse":            "suse",
+		"suse":                "suse",
+		"opensuse-leap":       "suse",
+		"opensuse-tumbleweed": "suse",
+	}
+
+	if family, ok := familyMap[distroID]; ok {
+		return family
+	}
+	return distroID
+}
+
+// linuxPrettyName returns /etc/os-release PRETTY_NAME (e.g. "CentOS Stream 8",
+// "Debian GNU/Linux 13 (trixie)") — the precise edition users recognise, which
+// gopsutil host.Info() flattens to a short id ("centos") + a bare number. Empty
+// if unavailable (non-Linux, or /etc/os-release missing).
+func linuxPrettyName() string {
+	f, err := os.Open("/etc/os-release")
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "PRETTY_NAME=") {
+			return strings.TrimSpace(strings.Trim(strings.TrimPrefix(line, "PRETTY_NAME="), `"'`))
+		}
+	}
+	return ""
+}
+
+// dispatcher is the package-level command dispatcher shared by mainLoop and push.
+var dispatcher *CommandDispatcher
+
+func push(cfg *Config) {
+	hostname, _ := os.Hostname()
+
+	// Collect pending acks from the dispatcher (if initialised).
+	var acks []CommandAck
+	if dispatcher != nil {
+		acks = dispatcher.GetAndClearAcks()
+	}
+
+	ipLocal, macAddress := getLocalNetworkInfo()
+	// Drain watchdog restart events so they're reported alongside metrics.
+	// If the push fails (non-2xx), we restore them so the next attempt
+	// will carry them up.
+	wdCount, wdLast := drainWatchdogRestarts()
+	body := pushBody{
+		DeviceUUID:            currentDeviceUUID(),
+		Hostname:              hostname,
+		AgentVersion:          cfg.AgentVersion,
+		OSInfo:                getOSInfo(),
+		Metrics:               collectMetrics(),
+		Acks:                  acks,
+		IPLocal:               ipLocal,
+		MACAddress:            macAddress,
+		PrivacyMode:           IsPrivacyMode(),
+		AirgapMode:            IsAirgapMode(),
+		LastLoggedInUser:      getLastLoggedInUser(),
+		DistroFamily:          getDistroFamily(),
+		AgentFlavor:           "modern",
+		AgentBuild:            agentBuildName(),
+		PSVersion:             powerShellVersionNoWait(),
+		Events:                drainEvents(),
+		WatchdogRestartCount:  wdCount,
+		WatchdogLastRestartAt: wdLast,
+		VirtualizationHost:    detectVirtualizationHost(),
+		BackupHost:            detectBackupHost(),
+		Oblireach:             obliReachMgr.Report(),
+		Prereqs:               nt6PrereqsForPush(),
+		VmConsole:             vmConsoleReportForPush(),
+	}
+
+	data, err := json.Marshal(body)
+	if err != nil {
+		log.Printf("Push error (marshal): %v", err)
+		restoreWatchdogRestarts(wdCount, wdLast)
+		return
+	}
+
+	req, err := http.NewRequest("POST", cfg.ServerURL+"/api/agent/push", bytes.NewReader(data))
+	if err != nil {
+		log.Printf("Push error (request): %v", err)
+		restoreWatchdogRestarts(wdCount, wdLast)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", cfg.APIKey)
+	req.Header.Set("X-Device-UUID", currentDeviceUUID())
+	applyIdentityHeaders(req.Header)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		log.Printf("Push error: %v", err)
+		restoreWatchdogRestarts(wdCount, wdLast)
+		// The acks were taken out of the dispatcher for this push: put them
+		// back, or the commands they answer stay "Sent" for ever.
+		if dispatcher != nil {
+			dispatcher.requeueAcks(acks)
+		}
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 500 && dispatcher != nil {
+		dispatcher.requeueAcks(acks)
+	}
+
+	var result pushResponse
+	_ = json.NewDecoder(resp.Body).Decode(&result)
+
+	switch resp.StatusCode {
+	case 200:
+		// Identity v2: the server re-keyed this device under the shared ID.
+		handleIdentityAck(resp)
+		backoffLevel = 0
+		cfg.BackoffUntil = 0
+
+		// Update poll interval from response — prefer nextPollIn, fall back to config field.
+		if result.NextPollIn > 0 && result.NextPollIn != cfg.CheckIntervalSeconds {
+			cfg.CheckIntervalSeconds = result.NextPollIn
+			_ = saveConfig(cfg)
+			log.Printf("Check interval updated to %ds (nextPollIn)", cfg.CheckIntervalSeconds)
+		} else if result.Config != nil {
+			interval := result.Config.PushIntervalSeconds
+			if interval == 0 {
+				interval = result.Config.CheckIntervalSeconds
+			}
+			if interval > 0 && interval != cfg.CheckIntervalSeconds {
+				cfg.CheckIntervalSeconds = interval
+				_ = saveConfig(cfg)
+				log.Printf("Check interval updated to %ds", cfg.CheckIntervalSeconds)
+			}
+		}
+		// Always update scan interval when config is present (independent of poll interval changes).
+		if result.Config != nil && result.Config.ScanIntervalSeconds != cfg.ScanIntervalSeconds {
+			cfg.ScanIntervalSeconds = result.Config.ScanIntervalSeconds
+			_ = saveConfig(cfg)
+			log.Printf("Scan interval updated to %ds", cfg.ScanIntervalSeconds)
+		}
+		// Update task retrieve delay when admin changes it.
+		if result.Config != nil && result.Config.TaskRetrieveDelaySeconds > 0 &&
+			result.Config.TaskRetrieveDelaySeconds != cfg.TaskRetrieveDelaySec {
+			cfg.TaskRetrieveDelaySec = result.Config.TaskRetrieveDelaySeconds
+			_ = saveConfig(cfg)
+			log.Printf("Task retrieve delay updated to %ds", cfg.TaskRetrieveDelaySec)
+		}
+		// Update remediation flag when admin toggles it per device.
+		if result.Config != nil && result.Config.RemediationEnabled != nil {
+			enabled := *result.Config.RemediationEnabled
+			if enabled != cfg.RemediationEnabled {
+				cfg.RemediationEnabled = enabled
+				_ = saveConfig(cfg)
+				log.Printf("Compliance remediation enabled: %v", enabled)
+			}
+			// Sync live dispatcher so in-flight compliance checks use the new flag immediately.
+			if dispatcher != nil {
+				dispatcher.SetRemediationEnabled(enabled)
+			}
+		}
+
+		// ObliReach target (nil = none sent → the manager idles, no report).
+		obliReachMgr.SetDesired(result.Oblireach)
+
+		log.Printf("Push OK (acks sent: %d, commands received: %d)", len(acks), len(result.Commands))
+
+		// Dispatch incoming commands asynchronously.
+		if dispatcher != nil {
+			for _, cmd := range result.Commands {
+				dispatcher.HandleCommand(cmd)
+			}
+		}
+
+		// Handle legacy one-shot command (e.g. "uninstall") — must be processed
+		// before the version check since commands like "uninstall" call os.Exit.
+		if result.Command != "" {
+			log.Printf("Received legacy command from server: %s", result.Command)
+			if result.Command == "uninstall" {
+				handleUninstallCommand(cfg)
+				return // not reached if uninstall succeeds
+			}
+		}
+
+		// result.LatestVersion is still parsed and reported for the "update
+		// available" UI badge, but the agent no longer auto-applies it — updates
+		// are admin-triggered via the update_agent command.
+
+	case 202:
+		log.Printf("Device pending approval...")
+		if result.NextPollIn > 0 && result.NextPollIn != cfg.CheckIntervalSeconds {
+			cfg.CheckIntervalSeconds = result.NextPollIn
+			_ = saveConfig(cfg)
+		} else if result.Config != nil {
+			interval := result.Config.PushIntervalSeconds
+			if interval == 0 {
+				interval = result.Config.CheckIntervalSeconds
+			}
+			if interval > 0 && interval != cfg.CheckIntervalSeconds {
+				cfg.CheckIntervalSeconds = interval
+				_ = saveConfig(cfg)
+			}
+		}
+		// Pending devices can also receive commands.
+		if dispatcher != nil {
+			for _, cmd := range result.Commands {
+				dispatcher.HandleCommand(cmd)
+			}
+		}
+		if result.Command != "" {
+			log.Printf("Received legacy command from server: %s", result.Command)
+			if result.Command == "uninstall" {
+				handleUninstallCommand(cfg)
+				return
+			}
+		}
+		// No auto-update here either — version is display-only (see case 200).
+
+	case 401:
+		idx := backoffLevel
+		if idx >= len(backoffSteps) {
+			idx = len(backoffSteps) - 1
+		}
+		backoffSecs := backoffSteps[idx]
+		log.Printf("Unauthorized. Backing off for %ds...", backoffSecs)
+		backoffLevel++
+		cfg.BackoffUntil = time.Now().UnixMilli() + int64(backoffSecs)*1000
+		_ = saveConfig(cfg)
+
+	default:
+		log.Printf("Push returned unexpected status %d", resp.StatusCode)
+	}
+}

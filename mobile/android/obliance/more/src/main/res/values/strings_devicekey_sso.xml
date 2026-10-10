@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Profile and security, enrolment of an Obligate account (SSO device keys). -->
+<resources>
+    <string name="more_devkey_enrol_ask_sso">To turn it on, confirm your identity with Obligate.</string>
+    <string name="more_devkey_enrol_sso_hint">Obligate asks for your password and a code, even with an Obligate session already open. Your fingerprint is asked right after.</string>
+    <string name="more_devkey_reauth">Confirm with Obligate</string>
+    <string name="more_devkey_busy_sso">Confirming with Obligate, then the fingerprint…</string>
+    <string name="more_devkey_problem_reauth_required">The Obligate confirmation expired or your Obligate account changed. Confirm again.</string>
+    <string name="more_devkey_problem_reauth_failed">The confirmation with Obligate did not succeed. Try again.</string>
+    <string name="more_devkey_problem_reauth_no_otp">Turn on two-factor authentication in your Obligate account first: the confirmation needs your password and a code.</string>
+    <string name="more_devkey_problem_reauth_final">Confirmation with Obligate is not possible right now, for the reason shown in the Obligate window. Trying again will not help: contact an administrator if this persists.</string>
+    <string name="more_devkey_problem_verifier_unavailable">Obligate verification is temporarily unavailable. Try again in a moment.</string>
+</resources>

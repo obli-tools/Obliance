@@ -1,0 +1,1991 @@
+import { useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react';
+import {
+ ArrowLeft,
+ RefreshCw,
+ FolderPlus,
+ Upload,
+ Download,
+ Trash2,
+ Pencil,
+ File,
+ FolderOpen,
+ HardDrive,
+ ChevronRight,
+ Loader2,
+ FileText,
+ FileCode,
+ FileArchive,
+ FileImage,
+ FileVideo,
+ FileAudio,
+ FileSpreadsheet,
+ Shield,
+ Package,
+ Check,
+ CheckSquare,
+ X,
+ Edit3,
+ Save,
+ FolderInput,
+ PieChart,
+} from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import { clsx } from 'clsx';
+import toast from 'react-hot-toast';
+import { fileApi } from '@/api/file.api';
+import { isStepUpHandled } from '@/api/client';
+import { getSocket } from '@/socket/socketClient';
+import { isCommandSupported, unsupportedTooltip } from '@/utils/capabilities';
+import { saveBlob } from '@/utils/download';
+import { useIsCoarsePointer, useMediaQuery, MEDIA } from '@/hooks/useMediaQuery';
+import { useConfirm, usePrompt } from '@/components/common/ConfirmDialog';
+import { ActionMenu, type ActionMenuItem } from '@/components/common/ActionMenu';
+import { Modal } from '@/components/common/Modal';
+import type { Device, Command } from '@obliance/shared';
+import UsageAnalyzer from './UsageAnalyzer';
+import { AnalyzeButton, DriveSpace, UsageVolumes, agentTooOldText, parseVolumes, usageAvailability, type UsageVolume } from './usageShared';
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+interface FileInfo {
+ name: string;
+ path: string;
+ isDir: boolean;
+ size: number;
+ modified: string;
+ mode: string;
+ // Roots only (Windows drives, agent listRoots): the volume's space.
+ totalBytes?: number;
+ freeBytes?: number;
+ label?: string;
+ fsType?: string;
+}
+
+/** Dragged rows (move into another sub-tab or a folder): MIME of the payload. */
+const DRAG_MIME = 'application/x-obliance-files';
+
+interface DraggedItem {
+ path: string;
+ name: string;
+ isDir: boolean;
+}
+
+// The rows being dragged (dataTransfer data cannot be read during dragover,
+// only its types): set on dragstart, cleared on dragend.
+let activeDrag: { deviceId: Device['id']; paneId: string; items: DraggedItem[] } | null = null;
+
+/** Folders changed by an operation: the panes showing one of them reload. */
+export interface ExplorerRefreshSignal {
+ seq: number;
+ paths: string[];
+ /** The pane that already reloaded itself (null: every matching pane reloads). */
+ sourcePaneId: string | null;
+}
+
+export interface ExplorerPaneProps {
+ device: Device;
+ paneId: string;
+ /** Folder opened at mount ('' = drives / root). */
+ initialPath: string;
+ /** Hidden panes stay mounted (state, scroll position) but are not displayed. */
+ visible: boolean;
+ /** The focused pane (the one of a mosaic that gets the keyboard shortcuts). */
+ focused: boolean;
+ /** Rows of the mosaic this pane sits in (0 = single view). */
+ mosaicRows: number;
+ onFocus: (paneId: string) => void;
+ onPathChange: (paneId: string, path: string) => void;
+ /** 2FA confirmations in flight, shared by the panes of the device (one prompt per action). */
+ stepUpMap: Map<string, Promise<unknown>>;
+ refreshSignal: ExplorerRefreshSignal;
+ onChanged: (paths: string[], sourcePaneId: string | null) => void;
+ /** The pane's text editor has unsaved changes (closing the sub-tab asks first). */
+ onDirtyChange?: (paneId: string, dirty: boolean) => void;
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+const MAX_UPLOAD_SIZE = 150 * 1024 * 1024; // 150 MB
+// Server refusals of FILE_EXPLORER_CMD that would repeat for every file of a batch.
+const BATCH_STOP_CODES = new Set(['restricted', 'forbidden', 'not_found', 'session', 'step_up_required', 'invalid']);
+// Touch devices: the base64 copy of the file lives in the WebView's memory.
+const MAX_UPLOAD_MB_TOUCH = 25;
+const MAX_UPLOAD_SIZE_TOUCH = MAX_UPLOAD_MB_TOUCH * 1024 * 1024;
+
+// 40 px tap targets on touch screens (desktop sizes unchanged).
+const TB = 'coarse:min-h-10 coarse:min-w-10 coarse:inline-flex coarse:items-center coarse:justify-center';
+
+// File names / paths: no autocapitalize / autocorrect on mobile keyboards.
+const PLAIN_INPUT = { autoCapitalize: 'off', autoCorrect: 'off', spellCheck: false } as const;
+
+function formatSize(bytes: number): string {
+ if (bytes <= 0) return '-';
+ if (bytes < 1024) return `${bytes} B`;
+ if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
+ if (bytes < 1073741824) return `${(bytes / 1048576).toFixed(1)} MB`;
+ return `${(bytes / 1073741824).toFixed(2)} GB`;
+}
+
+function formatDate(iso: string): string {
+ if (!iso) return '-';
+ try {
+ return new Date(iso).toLocaleString();
+ } catch {
+ return iso;
+ }
+}
+
+const EXT_ICON_MAP: Record<string, typeof File> = {
+ pdf: FileText,
+ doc: FileText,
+ docx: FileText,
+ txt: FileText,
+ md: FileText,
+ log: FileText,
+ csv: FileSpreadsheet,
+ xls: FileSpreadsheet,
+ xlsx: FileSpreadsheet,
+ js: FileCode,
+ ts: FileCode,
+ jsx: FileCode,
+ tsx: FileCode,
+ py: FileCode,
+ go: FileCode,
+ rs: FileCode,
+ java: FileCode,
+ c: FileCode,
+ cpp: FileCode,
+ h: FileCode,
+ cs: FileCode,
+ rb: FileCode,
+ php: FileCode,
+ html: FileCode,
+ css: FileCode,
+ json: FileCode,
+ xml: FileCode,
+ yaml: FileCode,
+ yml: FileCode,
+ sh: FileCode,
+ bat: FileCode,
+ ps1: FileCode,
+ zip: FileArchive,
+ rar: FileArchive,
+ '7z': FileArchive,
+ tar: FileArchive,
+ gz: FileArchive,
+ bz2: FileArchive,
+ xz: FileArchive,
+ png: FileImage,
+ jpg: FileImage,
+ jpeg: FileImage,
+ gif: FileImage,
+ bmp: FileImage,
+ svg: FileImage,
+ webp: FileImage,
+ ico: FileImage,
+ mp4: FileVideo,
+ mkv: FileVideo,
+ avi: FileVideo,
+ mov: FileVideo,
+ wmv: FileVideo,
+ mp3: FileAudio,
+ wav: FileAudio,
+ flac: FileAudio,
+ ogg: FileAudio,
+ aac: FileAudio,
+ exe: Package,
+ msi: Package,
+ dmg: Package,
+ deb: Package,
+ rpm: Package,
+ appimage: Package,
+ dll: Shield,
+ sys: Shield,
+ so: Shield,
+ dylib: Shield,
+};
+
+function getFileIcon(file: FileInfo) {
+ if (file.isDir) return FolderOpen;
+ const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+ return EXT_ICON_MAP[ext] || File;
+}
+
+function pathSeparator(osType: string): string {
+ return osType === 'windows' ? '\\' : '/';
+}
+
+function joinPath(base: string, name: string, osType: string): string {
+ const sep = pathSeparator(osType);
+ if (!base) return name;
+ if (base.endsWith(sep)) return base + name;
+ return base + sep + name;
+}
+
+/** Parent folder of a path ('' = the root listing: drives on Windows, / elsewhere). */
+function parentPath(path: string, osType: string): string {
+ const sep = pathSeparator(osType);
+ const parts = path.split(sep).filter(Boolean);
+ if (parts.length <= 1) return '';
+ parts.pop();
+ return osType === 'windows' ? parts.join(sep) + (parts.length === 1 ? sep : '') : sep + parts.join(sep);
+}
+
+/** Path equality: case-insensitive on Windows, trailing separator ignored. */
+export function samePath(a: string, b: string, osType: string): boolean {
+ const sep = pathSeparator(osType);
+ const norm = (p: string) => {
+ const v = p.length > 1 && p.endsWith(sep) ? p.slice(0, -1) : p;
+ return osType === 'windows' ? v.toLowerCase() : v;
+ };
+ return norm(a) === norm(b);
+}
+
+/** True when `path` is `dir` or lies under it. */
+function isInside(path: string, dir: string, osType: string): boolean {
+ if (samePath(path, dir, osType)) return true;
+ const sep = pathSeparator(osType);
+ const d = dir.endsWith(sep) ? dir : dir + sep;
+ return osType === 'windows' ? path.toLowerCase().startsWith(d.toLowerCase()) : path.startsWith(d);
+}
+
+/** Last segment of a path: the sub-tab label ('' at the root). */
+export function folderLabel(path: string, osType: string): string {
+ const parts = path.split(pathSeparator(osType)).filter(Boolean);
+ return parts[parts.length - 1] ?? '';
+}
+
+function splitBreadcrumb(path: string, osType: string): { label: string; path: string }[] {
+ if (!path) return [];
+ const sep = pathSeparator(osType);
+ const parts = path.split(sep).filter(Boolean);
+ const crumbs: { label: string; path: string }[] = [];
+
+ // On Windows, first part is the drive like "C:"
+ for (let i = 0; i < parts.length; i++) {
+ const partialPath =
+ osType === 'windows'
+ ? parts.slice(0, i + 1).join(sep) + (i === 0 ? sep : '')
+ : sep + parts.slice(0, i + 1).join(sep);
+ crumbs.push({ label: parts[i], path: partialPath });
+ }
+ return crumbs;
+}
+
+// ─── Component ───────────────────────────────────────────────────────────────
+
+/**
+ * One Files view of a device (a sub-tab of the Explorer tab): its own folder,
+ * listing, selection, scroll position, inline rename / delete, context menu
+ * and text editor. Several panes of the same device live side by side
+ * (FileExplorerTab): each keeps its own command bookkeeping; the 2FA
+ * confirmations in flight are shared (`stepUpMap`) and a change made in one
+ * pane reloads the panes showing the same folder (`refreshSignal`).
+ */
+export default function ExplorerPane({
+ device,
+ paneId,
+ initialPath,
+ visible,
+ focused,
+ mosaicRows,
+ onFocus,
+ onPathChange,
+ stepUpMap,
+ refreshSignal,
+ onChanged,
+ onDirtyChange,
+}: ExplorerPaneProps) {
+ const { t } = useTranslation();
+ const confirm = useConfirm();
+ const prompt = usePrompt();
+ // Touch screens: a tap opens (folder → navigate,
+ // text file → editor, other file → actions menu), the file icon toggles the
+ // selection, row actions stay visible (or sit in a "⋯" menu on phones) and
+ // rename / delete go through dialogs. Desktop keeps click = select,
+ // double-click = open, the right-click menu and the inline rename / delete.
+ const isCoarse = useIsCoarsePointer();
+ // The text editor is a side panel from lg up, a full-screen sheet below.
+ const isLg = useMediaQuery(MEDIA.lg);
+ // The per-row "⋯" menu only exists below md: not mounted at all on
+ // desktop (large folders would otherwise mount thousands of hidden menus).
+ const isMd = useMediaQuery(MEDIA.md);
+ const fileInputRef = useRef<HTMLInputElement>(null);
+ const [currentPath, setCurrentPath] = useState('');
+ const [files, setFiles] = useState<FileInfo[]>([]);
+ const [loading, setLoading] = useState(false);
+ const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
+ // 'upload' = files from the computer, 'move' = rows of a Files view.
+ const [dragOver, setDragOver] = useState<'upload' | 'move' | null>(null);
+ // Folder row hovered by a row drag (move into that folder).
+ const [dropRow, setDropRow] = useState<string | null>(null);
+ const rootRef = useRef<HTMLDivElement>(null);
+ const scrollRef = useRef<HTMLDivElement>(null);
+ const scrollTopRef = useRef(0);
+ const currentPathRef = useRef(initialPath);
+ const [renamingFile, setRenamingFile] = useState<string | null>(null);
+ const [renameValue, setRenameValue] = useState('');
+ const [deletingFile, setDeletingFile] = useState<string | null>(null);
+ const [operationInProgress, setOperationInProgress] = useState<Set<string>>(new Set());
+ const renameInputRef = useRef<HTMLInputElement>(null);
+
+ // Text editor panel state
+ const [editorFile, setEditorFile] = useState<FileInfo | null>(null);
+ const [editorContent, setEditorContent] = useState('');
+ const [editorOriginal, setEditorOriginal] = useState('');
+ const [editorLoading, setEditorLoading] = useState(false);
+ const [editorSaving, setEditorSaving] = useState(false);
+
+ // Custom right-click context menu state (also opened by a long-press, or by
+ // a tap on a file that has no direct "open" action, on touch screens)
+ const [contextMenu, setContextMenu] = useState<{ x: number; y: number; file: FileInfo } | null>(null);
+ useEffect(() => {
+ if (!contextMenu) return;
+ const close = () => setContextMenu(null);
+ window.addEventListener('click', close);
+ window.addEventListener('scroll', close, true);
+ window.addEventListener('resize', close);
+ return () => {
+ window.removeEventListener('click', close);
+ window.removeEventListener('scroll', close, true);
+ window.removeEventListener('resize', close);
+ };
+ }, [contextMenu]);
+ const pendingCmdRef = useRef<Map<string, { resolve: (cmd: Command) => void; timer: ReturnType<typeof setTimeout> }>>(new Map());
+
+ const isWindows = device.osType === 'windows';
+
+ // Disk usage analyzer (UsageAnalyzer.tsx): the folder analyzed, shown or
+ // not (back to the files keeps it: its scan goes on). `seq` remounts it
+ // for another folder. Unix roots: the file systems' space.
+ const [usage, setUsage] = useState<{ root: string; open: boolean; seq: number } | null>(null);
+ const [volumes, setVolumes] = useState<UsageVolume[]>([]);
+ const usageOpen = !!usage?.open;
+
+ // ── Socket listener for command results ──────────────────────────────────
+
+ useEffect(() => {
+ const socket = getSocket();
+ if (!socket) return;
+
+ const handleResult = (msg: { id: string; commandType: string; status: string; result: any }) => {
+ const pending = pendingCmdRef.current.get(msg.id);
+ if (!pending) return;
+ clearTimeout(pending.timer);
+ pendingCmdRef.current.delete(msg.id);
+ pending.resolve({ id: msg.id, status: msg.status, result: msg.result } as any);
+ };
+
+ socket.on('FILE_EXPLORER_RESULT', handleResult);
+
+ return () => {
+ socket.off('FILE_EXPLORER_RESULT', handleResult);
+ for (const [, pending] of pendingCmdRef.current) {
+ clearTimeout(pending.timer);
+ }
+ pendingCmdRef.current.clear();
+ };
+ }, []);
+
+ // ── Send a command and wait for its result ───────────────────────────────
+
+ // Dangerous ops that get audited server-side
+ const AUDITED_OPS = new Set(['create_directory', 'rename_file', 'delete_file', 'upload_file']);
+
+ type ExplorerCommand = 'list_directory' | 'create_directory' | 'rename_file' | 'delete_file' | 'download_file' | 'upload_file'
+ | 'start_usage_scan' | 'get_usage_children' | 'get_usage_top_files' | 'cancel_usage_scan';
+
+ const emitCommand = useCallback(
+ (
+ type: ExplorerCommand,
+ payload: Record<string, any>,
+ timeoutMs: number,
+ ): Promise<any> => {
+ const socket = getSocket();
+ if (!socket) return Promise.reject(new Error('Socket not connected'));
+
+ const cmdId = crypto.randomUUID();
+ const audit = AUDITED_OPS.has(type)
+ ? { action: `file_explorer.${type}`, resourceType: payload.path?.endsWith('/') ? 'directory' : 'file', resourcePath: payload.path || payload.oldPath }
+ : undefined;
+
+ return new Promise<any>((resolve, reject) => {
+ const timer = setTimeout(() => {
+ pendingCmdRef.current.delete(cmdId);
+ reject(new Error('Command timed out'));
+ }, timeoutMs);
+ pendingCmdRef.current.set(cmdId, { resolve, timer });
+
+ socket.emit('FILE_EXPLORER_CMD', {
+ requestId: cmdId,
+ deviceId: device.id,
+ commandType: type,
+ payload,
+ audit,
+ });
+ });
+ },
+ [device.id],
+ );
+
+ // The tenant may mark an explorer action "sensitive" (restrictions matrix,
+ // browsing by default): the server answers `step_up_required`, the step-up
+ // route asks the usual 2FA prompt (API client) and the command is sent
+ // again once. One prompt per action at a time (a listing and a download
+ // may ask together). Browsing is then confirmed for a while; any other
+ // action for ONE operation (`batch`: the operations of a multi-file
+ // operation, confirmed once). Throws when the prompt is cancelled or
+ // refused — already reported to the user (isStepUpHandled).
+ // The map is shared by the panes of the device: sub-tabs restored together
+ // after a refresh ask ONE confirmation, not one each.
+ const sendCommand = useCallback(
+ async (type: ExplorerCommand, payload: Record<string, any>, timeoutMs = 30000, batch = 1): Promise<any> => {
+ const needsStepUp = (r: any) => r?.status === 'failure' && r?.result?.code === 'step_up_required';
+ const first = await emitCommand(type, payload, timeoutMs);
+ if (!needsStepUp(first)) return first;
+ let pending = stepUpMap.get(type);
+ const joined = !!pending;
+ if (!pending) {
+ pending = fileApi.stepUp(device.id, type, batch).finally(() => stepUpMap.delete(type));
+ stepUpMap.set(type, pending);
+ }
+ await pending;
+ const second = await emitCommand(type, payload, timeoutMs);
+ if (!joined || !needsStepUp(second)) return second;
+ // The confirmation this command waited for covered another operation
+ // (one confirmation per operation): confirm this one, once.
+ await fileApi.stepUp(device.id, type, batch);
+ return emitCommand(type, payload, timeoutMs);
+ },
+ [emitCommand, device.id, stepUpMap],
+ );
+
+ // The reason of a failed command: the server's refusals (code) translated,
+ // else the agent's text (result.result.error), else ''.
+ const failureText = (res: any): string => {
+ const r = res?.result;
+ switch (r?.code) {
+ case 'restricted': return t('fileExplorer.err.restricted', 'This file operation is restricted by your tenant (approval required): an approval cannot run it from the explorer. Ask an administrator.');
+ case 'forbidden': return t('fileExplorer.err.forbidden', 'The file explorer is not permitted for your team on this device.');
+ case 'not_found': return t('fileExplorer.err.notFound', 'Device not found.');
+ case 'session': return t('fileExplorer.err.session', 'Your session has expired. Sign in again.');
+ case 'step_up_required': return t('fileExplorer.err.stepUp', 'A two-factor confirmation is required for this file operation.');
+ case 'invalid': return t('fileExplorer.err.invalid', 'Invalid file explorer request.');
+ }
+ if (typeof r?.error === 'string' && r.error) return r.error;
+ return typeof res?.error === 'string' ? res.error : '';
+ };
+ // A thrown error, unless the 2FA prompt already told the user (cancelled, refused).
+ const toastError = (err: any, fallback: string) => {
+ if (isStepUpHandled(err)) return;
+ const serverText = err?.response?.data?.error;
+ toast.error((typeof serverText === 'string' && serverText) || err?.message || fallback);
+ };
+
+ // ── List directory ───────────────────────────────────────────────────────
+
+ const onPathChangeRef = useRef(onPathChange);
+ onPathChangeRef.current = onPathChange;
+
+ // `quiet`: no error toast (a restored sub-tab whose folder is gone falls
+ // back to the root silently). Resolves true when the folder was listed,
+ // null when the 2FA prompt was cancelled or refused.
+ const listDirectory = useCallback(
+ async (path: string, opts: { quiet?: boolean } = {}): Promise<boolean | null> => {
+ setLoading(true);
+ setSelectedFiles(new Set());
+ try {
+ const result = await sendCommand('list_directory', { path });
+ if (result.status === 'success') {
+ const items: FileInfo[] = (result as any).result?.files ?? (result as any).result ?? [];
+ // Sort: directories first, then alphabetically
+ items.sort((a, b) => {
+ if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+ return a.name.localeCompare(b.name);
+ });
+ // Another folder: start at the top (a reload keeps the scroll).
+ if (path !== currentPathRef.current) {
+ scrollTopRef.current = 0;
+ if (scrollRef.current) scrollRef.current.scrollTop = 0;
+ }
+ setFiles(items);
+ setVolumes(parseVolumes((result as any).result));
+ setCurrentPath(path);
+ currentPathRef.current = path;
+ onPathChangeRef.current(paneId, path);
+ return true;
+ }
+ if (!opts.quiet) toast.error(failureText(result) || t('fileExplorer.listFailed'));
+ } catch (err: any) {
+ // 2FA prompt cancelled / refused: already told, do not retry elsewhere.
+ if (isStepUpHandled(err)) return null;
+ if (!opts.quiet) toastError(err, t('fileExplorer.listFailed'));
+ } finally {
+ setLoading(false);
+ }
+ return false;
+ },
+ [sendCommand, t, paneId],
+ );
+
+ // ── Mount: open the initial folder (the root when it cannot be listed) ──
+
+ // (currentPathRef starts at `initialPath`; a re-run keeps the open folder.)
+ useEffect(() => {
+ const start = currentPathRef.current;
+ (async () => {
+ if (start) {
+ const ok = await listDirectory(start, { quiet: true });
+ if (ok !== false) return;
+ }
+ await listDirectory('');
+ })();
+ }, [listDirectory, device.id]);
+
+ // ── Another pane changed a folder this pane shows: reload it ────────────
+
+ useEffect(() => {
+ if (refreshSignal.seq === 0 || refreshSignal.sourcePaneId === paneId) return;
+ const here = currentPathRef.current;
+ if (!here) return;
+ if (refreshSignal.paths.some((p) => samePath(p, here, device.osType))) listDirectory(here, { quiet: true });
+ // eslint-disable-next-line react-hooks/exhaustive-deps
+ }, [refreshSignal.seq]);
+
+ // An operation of this pane changed `paths` (this pane reloads itself).
+ const notifyChanged = (paths: string[]) => onChanged(paths, paneId);
+
+ // ── Scroll position: kept while the pane is hidden ─────────────────────
+
+ useLayoutEffect(() => {
+ if (visible && !usageOpen && scrollRef.current) scrollRef.current.scrollTop = scrollTopRef.current;
+ }, [visible, usageOpen]);
+
+ // ── Keyboard focus follows the focused pane ────────────────────────────
+
+ useEffect(() => {
+ if (!focused || !visible) return;
+ const root = rootRef.current;
+ if (!root || root.contains(document.activeElement)) return;
+ // Never steal the focus from a field (rename, dialog, editor…).
+ const active = document.activeElement as HTMLElement | null;
+ if (active && (active.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName))) return;
+ root.focus({ preventScroll: true });
+ }, [focused, visible]);
+
+ // ── Navigation ──────────────────────────────────────────────────────────
+
+ const navigateUp = () => {
+ if (!currentPath) return;
+ listDirectory(parentPath(currentPath, device.osType));
+ };
+
+ const navigateTo = (file: FileInfo) => {
+ if (file.isDir) {
+ listDirectory(file.path);
+ }
+ };
+
+ const navigateToBreadcrumb = (path: string) => {
+ listDirectory(path);
+ };
+
+ // ── Selection ───────────────────────────────────────────────────────────
+
+ // True when a click comes from a finger. Decided per event, so a touch
+ // laptop used with a mouse keeps the desktop behaviour for mouse clicks.
+ const isTouchEvent = (e: React.MouseEvent) => {
+ const pt = (e.nativeEvent as PointerEvent).pointerType;
+ return pt ? pt === 'touch' : isCoarse;
+ };
+
+ const toggleSelect = (filePath: string, e: React.MouseEvent) => {
+ e.stopPropagation();
+ setSelectedFiles((prev) => {
+ const next = new Set(prev);
+ if (next.has(filePath)) {
+ next.delete(filePath);
+ } else {
+ next.add(filePath);
+ }
+ return next;
+ });
+ };
+
+ // ── Download ────────────────────────────────────────────────────────────
+
+ const handleDownload = async (file: FileInfo) => {
+ setOperationInProgress((prev) => new Set(prev).add(file.path));
+ try {
+ const result = await sendCommand('download_file', { path: file.path }, 60000);
+ if (result.status === 'success') {
+ const base64: string = (result as any).result?.data ?? '';
+ if (!base64) {
+ toast.error(t('fileExplorer.downloadEmpty'));
+ return;
+ }
+ const binaryStr = atob(base64);
+ const bytes = new Uint8Array(binaryStr.length);
+ for (let i = 0; i < binaryStr.length; i++) {
+ bytes[i] = binaryStr.charCodeAt(i);
+ }
+ // Native bridge in the Android app (blob: URLs cannot be downloaded
+ // there), classic <a download> in a browser.
+ const saved = await saveBlob(new Blob([bytes]), file.name, 'application/octet-stream');
+ if (saved) toast.success(t('fileExplorer.downloadSuccess'));
+ else toast.error(t('fileExplorer.downloadFailed'));
+ } else {
+ toast.error(failureText(result) || t('fileExplorer.downloadFailed'));
+ }
+ } catch (err: any) {
+ toastError(err, t('fileExplorer.downloadFailed'));
+ } finally {
+ setOperationInProgress((prev) => {
+ const s = new Set(prev);
+ s.delete(file.path);
+ return s;
+ });
+ }
+ };
+
+ // ── Text editor ─────────────────────────────────────────────────────────
+ //
+ // Extensions that open in the inline text editor are configurable globally
+ // (see Settings → File explorer). We fetch the list once at mount and fall
+ // back to a sane local default if the server isn't reachable.
+
+ const FALLBACK_EDITABLE: string[] = [
+ 'txt', 'md', 'log', 'json', 'xml', 'yaml', 'yml', 'ini', 'conf', 'cfg',
+ 'env', 'sh', 'bash', 'ps1', 'bat', 'cmd',
+ ];
+ const [editableExtensions, setEditableExtensions] = useState<Set<string>>(() => new Set(FALLBACK_EDITABLE));
+ useEffect(() => {
+ import('@/api/appConfig.api').then(({ appConfigApi }) => {
+ appConfigApi.getEditableExtensions()
+ .then(({ extensions }) => {
+ if (Array.isArray(extensions) && extensions.length > 0) {
+ setEditableExtensions(new Set(extensions.map((e) => e.toLowerCase())));
+ }
+ })
+ .catch(() => { /* keep fallback */ });
+ });
+ }, []);
+ const MAX_EDIT_SIZE = 2 * 1024 * 1024; // 2 MB
+
+ function isEditableText(file: FileInfo): boolean {
+ if (file.isDir) return false;
+ if (file.size > MAX_EDIT_SIZE) return false;
+ const name = file.name.toLowerCase();
+ const ext = name.split('.').pop() ?? '';
+ if (editableExtensions.has(ext)) return true;
+ // Files with no extension but common text names
+ if (name === 'dockerfile' || name === 'makefile' || name === 'readme' || name === 'license') return true;
+ return false;
+ }
+
+ const handleOpenEditor = async (file: FileInfo) => {
+ if (!isEditableText(file)) {
+ toast.error(t('fileExplorer.notEditable', 'This file is not editable as text'));
+ return;
+ }
+ setEditorFile(file);
+ setEditorLoading(true);
+ setEditorContent('');
+ setEditorOriginal('');
+ try {
+ const result = await sendCommand('download_file', { path: file.path }, 60000);
+ if (result.status === 'success') {
+ const base64: string = (result as any).result?.data ?? '';
+ const binaryStr = atob(base64);
+ const bytes = new Uint8Array(binaryStr.length);
+ for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
+ const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+ setEditorContent(text);
+ setEditorOriginal(text);
+ } else {
+ toast.error(failureText(result) || t('fileExplorer.downloadFailed'));
+ setEditorFile(null);
+ }
+ } catch (err: any) {
+ toastError(err, t('fileExplorer.downloadFailed'));
+ setEditorFile(null);
+ } finally {
+ setEditorLoading(false);
+ }
+ };
+
+ const handleSaveEditor = async () => {
+ if (!editorFile) return;
+ setEditorSaving(true);
+ try {
+ const encoder = new TextEncoder();
+ const bytes = encoder.encode(editorContent);
+ let binary = '';
+ for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+ const base64 = btoa(binary);
+ const result = await sendCommand('upload_file', { path: editorFile.path, data: base64, overwrite: true }, 60000);
+ if (result.status === 'success') {
+ toast.success(t('fileExplorer.saved', 'File saved'));
+ setEditorOriginal(editorContent);
+ await listDirectory(currentPath);
+ notifyChanged([parentPath(editorFile.path, device.osType)]);
+ } else {
+ toast.error(failureText(result) || t('fileExplorer.saveFailed', 'Save failed'));
+ }
+ } catch (err: any) {
+ toastError(err, t('fileExplorer.saveFailed', 'Save failed'));
+ } finally {
+ setEditorSaving(false);
+ }
+ };
+
+ const handleCloseEditor = async () => {
+ if (editorContent !== editorOriginal) {
+ const ok = await confirm({
+ message: t('fileExplorer.unsavedChanges', 'You have unsaved changes. Close anyway?'),
+ confirmLabel: t('fileExplorer.discardChanges', 'Discard changes'),
+ danger: true,
+ });
+ if (!ok) return;
+ }
+ setEditorFile(null);
+ setEditorContent('');
+ setEditorOriginal('');
+ };
+
+ // ── Create directory ────────────────────────────────────────────────────
+
+ const handleCreateFolder = async () => {
+ const name = await prompt({
+ title: t('fileExplorer.newFolder'),
+ message: t('fileExplorer.newFolderPrompt'),
+ required: true,
+ confirmLabel: t('common.create', 'Create'),
+ });
+ if (!name?.trim()) return;
+ const dirPath = joinPath(currentPath, name.trim(), device.osType);
+ setLoading(true);
+ try {
+ const result = await sendCommand('create_directory', { path: dirPath });
+ if (result.status === 'success') {
+ toast.success(t('fileExplorer.folderCreated'));
+ await listDirectory(currentPath);
+ notifyChanged([currentPath]);
+ } else {
+ toast.error(failureText(result) || t('fileExplorer.folderCreateFailed'));
+ setLoading(false);
+ }
+ } catch (err: any) {
+ toastError(err, t('fileExplorer.folderCreateFailed'));
+ setLoading(false);
+ }
+ };
+
+ // ── Rename ──────────────────────────────────────────────────────────────
+
+ const startRename = (file: FileInfo) => {
+ setRenamingFile(file.path);
+ setRenameValue(file.name);
+ setTimeout(() => renameInputRef.current?.select(), 50);
+ };
+
+ const confirmRename = async (file: FileInfo, value: string = renameValue) => {
+ const newName = value.trim();
+ if (!newName || newName === file.name) {
+ setRenamingFile(null);
+ return;
+ }
+ const newPath = joinPath(
+ currentPath,
+ newName,
+ device.osType,
+ );
+ setOperationInProgress((prev) => new Set(prev).add(file.path));
+ setRenamingFile(null);
+ try {
+ const result = await sendCommand('rename_file', { oldPath: file.path, newPath });
+ if (result.status === 'success') {
+ toast.success(t('fileExplorer.renamed'));
+ await listDirectory(currentPath);
+ notifyChanged([currentPath]);
+ } else {
+ toast.error(failureText(result) || t('fileExplorer.renameFailed'));
+ }
+ } catch (err: any) {
+ toastError(err, t('fileExplorer.renameFailed'));
+ } finally {
+ setOperationInProgress((prev) => {
+ const s = new Set(prev);
+ s.delete(file.path);
+ return s;
+ });
+ }
+ };
+
+ // Touch screens: rename through a dialog (the inline field is too narrow).
+ const renameViaDialog = async (file: FileInfo) => {
+ const value = await prompt({
+ title: t('fileExplorer.rename'),
+ defaultValue: file.name,
+ required: true,
+ confirmLabel: t('fileExplorer.rename'),
+ });
+ if (value === null) return;
+ await confirmRename(file, value);
+ };
+
+ // ── Delete ──────────────────────────────────────────────────────────────
+
+ const handleDelete = async (file: FileInfo) => {
+ setOperationInProgress((prev) => new Set(prev).add(file.path));
+ setDeletingFile(null);
+ try {
+ const result = await sendCommand('delete_file', { path: file.path, isDir: file.isDir });
+ if (result.status === 'success') {
+ toast.success(t('fileExplorer.deleted'));
+ await listDirectory(currentPath);
+ // Panes inside the deleted folder keep their listing until their next action.
+ notifyChanged([currentPath]);
+ } else {
+ toast.error(failureText(result) || t('fileExplorer.deleteFailed'));
+ }
+ } catch (err: any) {
+ toastError(err, t('fileExplorer.deleteFailed'));
+ } finally {
+ setOperationInProgress((prev) => {
+ const s = new Set(prev);
+ s.delete(file.path);
+ return s;
+ });
+ }
+ };
+
+ // Touch screens: confirm in a dialog instead of the inline "Delete? ✓ ✗".
+ const deleteViaDialog = async (file: FileInfo) => {
+ const ok = await confirm({
+ message: t('fileExplorer.deleteConfirm', 'Delete "{{name}}"?', { name: file.name }),
+ danger: true,
+ });
+ if (ok) await handleDelete(file);
+ };
+
+ const requestRename = (file: FileInfo) => {
+ if (isCoarse) renameViaDialog(file);
+ else startRename(file);
+ };
+
+ const requestDelete = (file: FileInfo) => {
+ if (isCoarse) deleteViaDialog(file);
+ else setDeletingFile(file.path);
+ };
+
+ // ── Upload (drag & drop) ────────────────────────────────────────────────
+
+ const handleDrop = async (e: React.DragEvent) => {
+ e.preventDefault();
+ setDragOver(null);
+ setDropRow(null);
+ const moved = readDrag(e);
+ if (moved) {
+ if (currentPath) await moveItems(moved, currentPath);
+ return;
+ }
+ await uploadFiles(Array.from(e.dataTransfer.files));
+ };
+
+ const uploadFiles = async (droppedFiles: File[]) => {
+ if (droppedFiles.length === 0) return;
+
+ // Each file is read whole into memory as base64 and sent in one command:
+ // on touch devices (phones / tablets, often low on RAM) a large file can
+ // crash the WebView tab, so they get a lower cap until uploads are chunked.
+ const uploadLimit = isCoarse ? MAX_UPLOAD_SIZE_TOUCH : MAX_UPLOAD_SIZE;
+ const oversized = droppedFiles.filter((f) => f.size > uploadLimit);
+ if (oversized.length > 0) {
+ const names = oversized.map((f) => f.name).join(', ');
+ toast.error(
+ isCoarse
+ ? t('fileExplorer.tooLargeTouch', '{{count}} file(s) exceed the {{limit}} MB upload limit on phones and tablets (the file is loaded in memory): {{names}}', {
+ count: oversized.length,
+ limit: MAX_UPLOAD_MB_TOUCH,
+ names,
+ })
+ : t('fileExplorer.tooLarge', '{{count}} file(s) exceed the 150 MB limit: {{names}}', {
+ count: oversized.length,
+ names,
+ }),
+ isCoarse ? { duration: 8000 } : undefined,
+ );
+ }
+
+ const valid = droppedFiles.filter((f) => f.size <= uploadLimit);
+ if (valid.length === 0) return;
+
+ setLoading(true);
+ let successCount = 0;
+ let failCount = 0;
+
+ for (const [index, file] of valid.entries()) {
+ try {
+ const base64 = await new Promise<string>((resolve, reject) => {
+ const reader = new FileReader();
+ reader.onload = () => {
+ const result = reader.result as string;
+ resolve(result.split(',')[1]);
+ };
+ reader.onerror = () => reject(new Error('Failed to read file'));
+ reader.readAsDataURL(file);
+ });
+
+ const destPath = joinPath(currentPath, file.name, device.osType);
+ // One 2FA confirmation (when the tenant asks one) covers the files left.
+ const result = await sendCommand('upload_file', { path: destPath, data: base64, overwrite: false }, 60000, valid.length - index);
+ if (result.status === 'success') {
+ successCount++;
+ } else {
+ failCount++;
+ // A refusal of the server holds for every file of the batch: say it once, stop.
+ if (BATCH_STOP_CODES.has(result?.result?.code)) {
+ toast.error(failureText(result));
+ break;
+ }
+ }
+ } catch (err) {
+ // 2FA prompt cancelled or refused: do not ask again for each file.
+ if (isStepUpHandled(err)) break;
+ failCount++;
+ }
+ }
+
+ if (successCount > 0) toast.success(t('fileExplorer.uploadedCount', '{{count}} file(s) uploaded', { count: successCount }));
+ if (failCount > 0) toast.error(t('fileExplorer.uploadFailedCount', '{{count}} file(s) failed to upload', { count: failCount }));
+ await listDirectory(currentPath);
+ if (successCount > 0) notifyChanged([currentPath]);
+ };
+
+ // ── Move (rows dragged onto a folder row or into another Files view) ────
+ //
+ // The agent's rename_file is os.Rename: a move on the same volume (moving
+ // to another drive fails and is reported). os.Rename replaces an existing
+ // file, so the destination is listed first and name clashes are skipped.
+
+ const isOwnDrag = (e: React.DragEvent) =>
+ !!activeDrag && activeDrag.deviceId === device.id && Array.from(e.dataTransfer.types).includes(DRAG_MIME);
+
+ const readDrag = (e: React.DragEvent): DraggedItem[] | null => {
+ if (!isOwnDrag(e)) return null;
+ return activeDrag?.items ?? null;
+ };
+
+ // The dragged items that can go into `destDir` (not already there, not a
+ // folder into itself or one of its subfolders).
+ const movableTo = (items: DraggedItem[], destDir: string) =>
+ items.filter((it) => !samePath(parentPath(it.path, device.osType), destDir, device.osType) && !(it.isDir && isInside(destDir, it.path, device.osType)));
+
+ const moveItems = async (items: DraggedItem[], destDir: string) => {
+ const todo = movableTo(items, destDir);
+ if (todo.length === 0 || !canRename) return;
+ const destLabel = folderLabel(destDir, device.osType) || destDir;
+ const ok = await confirm({
+ title: t('fileExplorer.move.title', 'Move'),
+ message: todo.length === 1
+ ? t('fileExplorer.move.confirmOne', 'Move "{{name}}" to "{{dest}}"?', { name: todo[0].name, dest: destLabel })
+ : t('fileExplorer.move.confirmMany', 'Move {{count}} items to "{{dest}}"?', { count: todo.length, dest: destLabel }),
+ confirmLabel: t('fileExplorer.move.action', 'Move'),
+ });
+ if (!ok) return;
+
+ setLoading(true);
+ let moved = 0;
+ let failed = 0;
+ let skipped = 0;
+ try {
+ const listing = await sendCommand('list_directory', { path: destDir });
+ if (listing.status !== 'success') {
+ toast.error(failureText(listing) || t('fileExplorer.listFailed'));
+ return;
+ }
+ const fold = (n: string) => (isWindows ? n.toLowerCase() : n);
+ const existing = new Set<string>(
+ (((listing as any).result?.files ?? (listing as any).result ?? []) as FileInfo[]).map((f) => fold(f.name)),
+ );
+ for (const [index, it] of todo.entries()) {
+ if (existing.has(fold(it.name))) {
+ skipped++;
+ continue;
+ }
+ try {
+ const res = await sendCommand('rename_file', { oldPath: it.path, newPath: joinPath(destDir, it.name, device.osType) }, 30000, todo.length - index);
+ if (res.status === 'success') {
+ moved++;
+ } else {
+ failed++;
+ if (BATCH_STOP_CODES.has(res?.result?.code)) {
+ toast.error(failureText(res));
+ break;
+ }
+ if (todo.length === 1) toast.error(failureText(res) || t('fileExplorer.move.failed', 'Move failed'));
+ }
+ } catch (err) {
+ if (isStepUpHandled(err)) break;
+ failed++;
+ }
+ }
+ } catch (err: any) {
+ toastError(err, t('fileExplorer.move.failed', 'Move failed'));
+ } finally {
+ setLoading(false);
+ }
+
+ if (moved > 0) toast.success(t('fileExplorer.move.done', '{{count}} item(s) moved', { count: moved }));
+ if (skipped > 0) toast.error(t('fileExplorer.move.skipped', '{{count}} item(s) skipped: an item with the same name already exists in the destination', { count: skipped }), { duration: 6000 });
+ if (failed > 0 && todo.length > 1) toast.error(t('fileExplorer.move.failedCount', '{{count}} item(s) could not be moved', { count: failed }));
+ if (moved > 0) {
+ const sources = todo.map((it) => parentPath(it.path, device.osType));
+ // Every pane showing the source or destination reloads, this one included.
+ onChanged([destDir, ...sources], null);
+ }
+ };
+
+ // The file input lives in the DOM (below): mobile WebView file choosers do
+ // not always honour a detached input. This is also the touch path —
+ // drag & drop only exists with a mouse.
+ const handleUploadClick = () => {
+ fileInputRef.current?.click();
+ };
+
+ const handleFileInputChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+ const input = e.currentTarget;
+ const picked = input.files ? Array.from(input.files) : [];
+ input.value = ''; // picking the same file again must fire onChange
+ await uploadFiles(picked);
+ };
+
+ // ── Render ──────────────────────────────────────────────────────────────
+
+ const breadcrumbs = splitBreadcrumb(currentPath, device.osType);
+ const isRoot = !currentPath;
+
+ // (The parent shows a banner instead of the panes when the agent build
+ // cannot list directories at all.)
+
+ // Per-command capability flags. Some agent builds (legacy) browse and
+ // mutate the filesystem but can't stream file bytes — gate upload/download
+ // individually so those buttons grey out while the rest stays usable.
+ const canCreateDir = isCommandSupported(device, 'create_directory');
+ const canUpload = isCommandSupported(device, 'upload_file');
+ const canDownload = isCommandSupported(device, 'download_file');
+ const canRename = isCommandSupported(device, 'rename_file');
+ const canDelete = isCommandSupported(device, 'delete_file');
+ const unsupported = unsupportedTooltip(t);
+
+ // ── Disk usage analyzer ─────────────────────────────────────────────────
+ const usageAvail = usageAvailability(device);
+ const openUsage = (path: string) => {
+ if (!path || !usageAvail.offered) return;
+ if (!usageAvail.ok) { toast.error(agentTooOldText(t)); return; }
+ setContextMenu(null);
+ setUsage((cur) => (cur && cur.root === path ? { ...cur, open: true } : { root: path, open: true, seq: (cur?.seq ?? 0) + 1 }));
+ };
+ const closeUsage = () => {
+ setUsage((cur) => (cur ? { ...cur, open: false } : cur));
+ requestAnimationFrame(() => rootRef.current?.focus({ preventScroll: true }));
+ };
+ // The folder the toolbar button analyzes: the one on screen, or the drive
+ // selected on the drives list ('' : none).
+ const usageTarget = (() => {
+ if (currentPath) return currentPath;
+ if (!isWindows) return '/';
+ const sel = files.filter((f) => selectedFiles.has(f.path));
+ return sel.length === 1 && sel[0].isDir ? sel[0].path : '';
+ })();
+ const usageButtonTitle = !usageAvail.ok
+ ? agentTooOldText(t)
+ : !usageTarget
+ ? t('fileExplorer.usage.pickDrive', 'Select a drive to analyze its disk usage')
+ : t('fileExplorer.usage.analyze', 'Analyze disk usage');
+
+ // "Open" = what a double-click does on desktop and a tap does on touch.
+ const openFile = (file: FileInfo, at: { x: number; y: number }) => {
+ if (file.isDir) {
+ navigateTo(file);
+ } else if (isEditableText(file) && canDownload) {
+ handleOpenEditor(file);
+ } else {
+ // No direct action: show the file's actions where the finger is.
+ setContextMenu({ x: at.x, y: at.y, file });
+ }
+ };
+
+ // Row actions for the "⋯" menu (phones / tablets).
+ const fileActions = (file: FileInfo): ActionMenuItem[] => {
+ const editable = !file.isDir && isEditableText(file);
+ return [
+ {
+ key: 'open',
+ icon: <FolderOpen className="w-4 h-4 text-yellow-500" />,
+ label: t('fileExplorer.open', 'Open'),
+ onClick: () => navigateTo(file),
+ hidden: !file.isDir,
+ },
+ {
+ key: 'usage',
+ icon: <PieChart className="w-4 h-4 text-accent" />,
+ label: t('fileExplorer.usage.analyze', 'Analyze disk usage'),
+ description: usageAvail.ok ? undefined : agentTooOldText(t),
+ onClick: () => openUsage(file.path),
+ hidden: !file.isDir || !usageAvail.offered,
+ disabled: !usageAvail.ok,
+ },
+ {
+ key: 'edit',
+ icon: <Edit3 className="w-4 h-4 text-accent" />,
+ label: t('fileExplorer.edit', 'Edit'),
+ onClick: () => handleOpenEditor(file),
+ hidden: !editable || !canDownload,
+ },
+ {
+ key: 'download',
+ icon: <Download className="w-4 h-4 text-accent" />,
+ label: t('fileExplorer.download'),
+ description: canDownload ? undefined : unsupported,
+ onClick: () => handleDownload(file),
+ hidden: file.isDir,
+ disabled: !canDownload,
+ },
+ {
+ key: 'rename',
+ icon: <Pencil className="w-4 h-4 text-accent" />,
+ label: t('fileExplorer.rename'),
+ description: canRename ? undefined : unsupported,
+ onClick: () => renameViaDialog(file),
+ disabled: !canRename,
+ separator: true,
+ },
+ {
+ key: 'delete',
+ icon: <Trash2 className="w-4 h-4" />,
+ label: t('fileExplorer.delete'),
+ description: canDelete ? undefined : unsupported,
+ onClick: () => deleteViaDialog(file),
+ disabled: !canDelete,
+ danger: true,
+ },
+ ];
+ };
+
+ // ── Keyboard shortcuts (the focused pane only: they listen on its root) ──
+ //
+ // ↑ / ↓ move the selection, Enter opens, Backspace or Alt+↑ goes up,
+ // F5 reloads, F2 renames, Delete deletes, Ctrl+A selects all, Esc clears.
+
+ const selectIndex = (index: number) => {
+ const file = files[index];
+ if (!file) return;
+ setSelectedFiles(new Set([file.path]));
+ scrollRef.current
+ ?.querySelector<HTMLElement>(`tr[data-index="${index}"]`)
+ ?.scrollIntoView({ block: 'nearest' });
+ };
+
+ const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+ const el = e.target as HTMLElement;
+ if (el.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON'].includes(el.tagName)) return;
+ if (loading || renamingFile || usageOpen) return;
+ const mod = e.ctrlKey || e.metaKey;
+ const selected = files.filter((f) => selectedFiles.has(f.path));
+ const single = selected.length === 1 ? selected[0] : null;
+ let handled = true;
+ if (e.key === 'Backspace' || (e.altKey && e.key === 'ArrowUp')) {
+ navigateUp();
+ } else if (e.key === 'F5') {
+ listDirectory(currentPath);
+ } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+ if (files.length === 0) return;
+ const indexes = files.map((f, i) => (selectedFiles.has(f.path) ? i : -1)).filter((i) => i >= 0);
+ const next = e.key === 'ArrowDown'
+ ? (indexes.length ? Math.min(files.length - 1, indexes[indexes.length - 1] + 1) : 0)
+ : (indexes.length ? Math.max(0, indexes[0] - 1) : files.length - 1);
+ selectIndex(next);
+ } else if (e.key === 'Enter' && single) {
+ if (single.isDir) navigateTo(single);
+ else if (isEditableText(single) && canDownload) handleOpenEditor(single);
+ } else if (e.key === 'F2' && single && canRename) {
+ requestRename(single);
+ } else if (e.key === 'Delete' && single && canDelete) {
+ requestDelete(single);
+ } else if (mod && e.key.toLowerCase() === 'a') {
+ setSelectedFiles(new Set(files.map((f) => f.path)));
+ } else if (e.key === 'Escape' && (selectedFiles.size > 0 || deletingFile)) {
+ setSelectedFiles(new Set());
+ setDeletingFile(null);
+ } else {
+ handled = false;
+ }
+ if (handled) {
+ e.preventDefault();
+ e.stopPropagation();
+ }
+ };
+
+ // ── Row drag (move) — mouse only ────────────────────────────────────────
+
+ const handleRowDragStart = (e: React.DragEvent, file: FileInfo) => {
+ const group = selectedFiles.has(file.path) ? files.filter((f) => selectedFiles.has(f.path)) : [file];
+ const items = group.map((f) => ({ path: f.path, name: f.name, isDir: f.isDir }));
+ activeDrag = { deviceId: device.id, paneId, items };
+ e.dataTransfer.effectAllowed = 'move';
+ e.dataTransfer.setData(DRAG_MIME, JSON.stringify(items.map((it) => it.path)));
+ // Text fallback (dropping on a text field gives the path, not a move).
+ e.dataTransfer.setData('text/plain', items.map((it) => it.path).join('\n'));
+ };
+
+ const handleRowDragEnd = () => {
+ activeDrag = null;
+ setDropRow(null);
+ setDragOver(null);
+ };
+
+ // A folder row accepts the dragged rows (not itself, not into a child).
+ const rowDropProps = (file: FileInfo) => {
+ if (!file.isDir || !canRename) return {};
+ return {
+ onDragOver: (e: React.DragEvent) => {
+ const items = readDrag(e);
+ if (!items || movableTo(items, file.path).length === 0) return;
+ e.preventDefault();
+ e.stopPropagation();
+ e.dataTransfer.dropEffect = 'move';
+ if (dropRow !== file.path) setDropRow(file.path);
+ if (dragOver) setDragOver(null);
+ },
+ onDragLeave: () => setDropRow((cur) => (cur === file.path ? null : cur)),
+ onDrop: async (e: React.DragEvent) => {
+ const items = readDrag(e);
+ if (!items) return;
+ e.preventDefault();
+ e.stopPropagation();
+ setDropRow(null);
+ setDragOver(null);
+ await moveItems(items, file.path);
+ },
+ };
+ };
+
+ const editorDirty = editorContent !== editorOriginal;
+ const hasUnsaved = !!editorFile && editorDirty;
+ useEffect(() => {
+ onDirtyChange?.(paneId, hasUnsaved);
+ }, [hasUnsaved, paneId, onDirtyChange]);
+ // In a mosaic the side panel would squeeze the pane: the editor opens as a sheet.
+ const editorAsSheet = !!editorFile && (!isLg || mosaicRows > 0);
+
+ // Height of the list's own scroll area: the whole view in a single pane,
+ // the pane's share of it in a mosaic (one or two rows of panes).
+ const listMaxHeight = mosaicRows === 2
+ ? 'max(200px, calc((100vh - 470px) / 2))'
+ : mosaicRows === 1
+ ? 'max(240px, calc(100vh - 370px))'
+ : undefined;
+
+ const saveButton = (
+ <button
+ onClick={handleSaveEditor}
+ disabled={editorSaving || editorLoading || !editorDirty}
+ className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-accent text-white hover:bg-accent/90 disabled:opacity-40 disabled:cursor-not-allowed transition-colors coarse:min-h-10"
+ title={t('fileExplorer.save', 'Save')}
+ >
+ {editorSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+ {t('fileExplorer.save', 'Save')}
+ </button>
+ );
+
+ const unsavedBadge = editorDirty && (
+ <span className="text-xs text-orange-400 shrink-0">{t('fileExplorer.unsavedBadge', 'modified')}</span>
+ );
+
+ const renderEditorArea = (textareaClassName: string) => (
+ <div className="flex-1 min-h-0 relative">
+ {editorLoading ? (
+ <div className="absolute inset-0 flex items-center justify-center">
+ <Loader2 className="w-6 h-6 text-accent animate-spin" />
+ </div>
+ ) : (
+ <textarea
+ value={editorContent}
+ onChange={(e) => setEditorContent(e.target.value)}
+ {...PLAIN_INPUT}
+ aria-label={editorFile?.name}
+ className={textareaClassName}
+ onKeyDown={(e) => {
+ if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+ e.preventDefault();
+ handleSaveEditor();
+ }
+ }}
+ />
+ )}
+ </div>
+ );
+
+ const editorStats = (
+ <>
+ <span>{t('fileExplorer.editorStats', '{{chars}} chars · {{lines}} lines', { chars: editorContent.length, lines: editorContent.split('\n').length })}</span>
+ <span className="opacity-60 coarse:hidden">{t('fileExplorer.ctrlSToSave', 'Ctrl+S to save')}</span>
+ </>
+ );
+
+ const inMosaic = mosaicRows > 0;
+
+ return (
+ <div
+ ref={rootRef}
+ tabIndex={-1}
+ role="region"
+ aria-label={currentPath || (isWindows ? t('fileExplorer.drives') : '/')}
+ data-pane-id={paneId}
+ className={clsx('flex gap-3 min-w-0 outline-none', !visible && 'hidden', inMosaic && 'h-full')}
+ onKeyDown={handleKeyDown}
+ // Any click or focus inside makes this pane the focused one (shortcuts).
+ onMouseDownCapture={() => { if (!focused) onFocus(paneId); }}
+ onFocusCapture={() => { if (!focused) onFocus(paneId); }}
+ >
+ <div className={clsx(
+ 'bg-bg-secondary rounded-xl overflow-hidden flex flex-col transition-shadow',
+ editorFile && !editorAsSheet ? 'flex-1 min-w-0' : 'w-full',
+ // Mosaic: the focused pane (the one that gets the shortcuts) is outlined.
+ inMosaic && (focused ? 'ring-1 ring-accent/60 shadow-lg shadow-accent/5' : 'ring-1 ring-transparent'),
+ )}>
+ {/* Hidden picker used by the Upload button (the touch upload path). */}
+ <input
+ ref={fileInputRef}
+ type="file"
+ multiple
+ className="hidden"
+ tabIndex={-1}
+ aria-hidden="true"
+ onChange={handleFileInputChange}
+ />
+
+ {usage && (
+ <UsageAnalyzer
+ key={usage.seq}
+ device={device}
+ root={usage.root}
+ visible={visible}
+ hidden={!usage.open}
+ listMaxHeight={listMaxHeight}
+ inMosaic={inMosaic}
+ canDelete={canDelete}
+ send={sendCommand}
+ failureText={failureText}
+ onClose={closeUsage}
+ onAnalyze={openUsage}
+ onReveal={async (dir, select) => {
+ closeUsage();
+ const ok = await listDirectory(dir);
+ if (ok && select) setSelectedFiles(new Set([select]));
+ }}
+ onChanged={(paths) => onChanged(paths, null)}
+ />
+ )}
+ {!usageOpen && (<>
+ {/* ── Top bar ──────────────────────────────────────────────────────── */}
+ <div className="px-4 py-3 flex items-center gap-2 flex-wrap max-sm:px-3">
+ {/* Back button */}
+ <button
+ onClick={navigateUp}
+ disabled={isRoot || loading}
+ className={clsx('p-1.5 rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-tertiary disabled:opacity-30 disabled:cursor-not-allowed transition-colors', TB)}
+ title={t('fileExplorer.back')}
+ aria-label={t('fileExplorer.back')}
+ >
+ <ArrowLeft className="w-4 h-4" />
+ </button>
+
+ {/* Breadcrumb (own line on phones) */}
+ <div className="flex items-center gap-1 text-sm min-w-0 flex-1 overflow-x-auto scrollbar-thin max-sm:order-last max-sm:basis-full overscroll-x-contain">
+ <button
+ onClick={() => listDirectory('')}
+ className={`shrink-0 flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium transition-colors coarse:py-2 coarse:px-2.5 ${
+ isRoot
+ ? 'text-accent bg-accent/10'
+ : 'text-text-muted hover:text-text-primary hover:bg-bg-tertiary'
+ }`}
+ >
+ <HardDrive className="w-3.5 h-3.5" />
+ {isWindows ? t('fileExplorer.drives') : '/'}
+ </button>
+ {breadcrumbs.map((crumb, i) => (
+ <div key={crumb.path} className="flex items-center gap-1 shrink-0">
+ <ChevronRight className="w-3 h-3 text-text-muted/50" />
+ <button
+ onClick={() => navigateToBreadcrumb(crumb.path)}
+ className={`px-1.5 py-0.5 rounded text-xs font-medium transition-colors coarse:py-2 coarse:px-2.5 ${
+ i === breadcrumbs.length - 1
+ ? 'text-accent bg-accent/10'
+ : 'text-text-muted hover:text-text-primary hover:bg-bg-tertiary'
+ }`}
+ >
+ {crumb.label}
+ </button>
+ </div>
+ ))}
+ </div>
+
+ {/* Action buttons */}
+ <div className="flex items-center gap-1 shrink-0 max-sm:ml-auto">
+ <button
+ onClick={() => listDirectory(currentPath)}
+ disabled={loading}
+ className={clsx('p-1.5 rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-tertiary disabled:opacity-30 transition-colors', TB)}
+ title={t('fileExplorer.refresh')}
+ aria-label={t('fileExplorer.refresh')}
+ >
+ <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+ </button>
+ {usageAvail.offered && (
+ <button
+ onClick={() => openUsage(usageTarget)}
+ disabled={loading || !usageAvail.ok || !usageTarget}
+ className={clsx('p-1.5 rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-tertiary disabled:opacity-30 disabled:cursor-not-allowed transition-colors', TB)}
+ title={usageButtonTitle}
+ aria-label={usageButtonTitle}
+ >
+ <PieChart className="w-4 h-4" />
+ </button>
+ )}
+ <button
+ onClick={handleCreateFolder}
+ disabled={loading || isRoot || !canCreateDir}
+ className={clsx('p-1.5 rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-tertiary disabled:opacity-30 disabled:cursor-not-allowed transition-colors', TB)}
+ title={canCreateDir ? t('fileExplorer.newFolder') : unsupported}
+ aria-label={canCreateDir ? t('fileExplorer.newFolder') : unsupported}
+ >
+ <FolderPlus className="w-4 h-4" />
+ </button>
+ <button
+ onClick={handleUploadClick}
+ disabled={loading || isRoot || !canUpload}
+ className={clsx('p-1.5 rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-tertiary disabled:opacity-30 disabled:cursor-not-allowed transition-colors', TB)}
+ title={canUpload ? t('fileExplorer.upload') : unsupported}
+ aria-label={canUpload ? t('fileExplorer.upload') : unsupported}
+ >
+ <Upload className="w-4 h-4" />
+ </button>
+ </div>
+ </div>
+
+ {volumes.length > 0 && <UsageVolumes volumes={volumes} device={device} onAnalyze={openUsage} />}
+
+ {/* ── File list / drop zone ────────────────────────────────────────── */}
+ <div
+ className={clsx(
+ 'flex-1 relative transition-colors',
+ mosaicRows === 2 ? 'min-h-[200px]' : 'min-h-[300px]',
+ dragOver && 'bg-accent/5 ring-2 ring-inset ring-accent/30',
+ )}
+ onDragOver={(e) => {
+ e.preventDefault();
+ const items = readDrag(e);
+ if (items) {
+ // Rows of a Files view: a move into this folder (not the root,
+ // nothing to do when they already are here).
+ const ok = !isRoot && canRename && movableTo(items, currentPath).length > 0;
+ e.dataTransfer.dropEffect = ok ? 'move' : 'none';
+ setDragOver(ok ? 'move' : null);
+ return;
+ }
+ if (!isRoot) setDragOver('upload');
+ }}
+ onDragLeave={() => setDragOver(null)}
+ onDrop={handleDrop}
+ >
+ {/* Drag overlay */}
+ {dragOver && (
+ <div className="absolute inset-0 z-10 flex items-center justify-center bg-accent/5 pointer-events-none">
+ <div className="flex flex-col items-center gap-2 text-accent text-center px-4">
+ {dragOver === 'move' ? (
+ <>
+ <FolderInput className="w-10 h-10" />
+ <span className="text-sm font-medium">{t('fileExplorer.move.dropHere', 'Drop to move here')}</span>
+ <span className="text-xs text-text-muted max-w-full truncate">{currentPath}</span>
+ </>
+ ) : (
+ <>
+ <Upload className="w-10 h-10" />
+ <span className="text-sm font-medium">{t('fileExplorer.dropToUpload')}</span>
+ <span className="text-xs text-text-muted">{t('fileExplorer.maxUploadSize', 'Max 150 MB per file')}</span>
+ </>
+ )}
+ </div>
+ </div>
+ )}
+
+ {/* Loading state (also swallows a second tap while a folder opens) */}
+ {loading && (
+ <div className="absolute inset-0 z-20 flex items-center justify-center bg-bg-secondary/80">
+ <Loader2 className="w-6 h-6 text-accent animate-spin" />
+ </div>
+ )}
+
+ {/* Table — nested scroll on large screens; on phones (and short
+ touch screens) the page scrolls instead of a 40 px strip. */}
+ {files.length > 0 ? (
+ <div
+ ref={scrollRef}
+ onScroll={(e) => { scrollTopRef.current = e.currentTarget.scrollTop; }}
+ // Mosaic (lg and up only): the pane's share of the view height.
+ style={listMaxHeight ? { maxHeight: listMaxHeight } : undefined}
+ className={clsx(
+ 'overflow-auto',
+ !inMosaic && 'max-h-[calc(100dvh-320px)] supports-[not(height:100dvh)]:max-h-[calc(100vh-320px)] max-md:max-h-none coarse:[@media(max-height:600px)]:max-h-none',
+ )}
+ >
+ <table className="w-full text-sm">
+ <thead className="sticky top-0 z-[5]">
+ <tr className="bg-bg-tertiary/80 backdrop-blur text-text-muted text-xs uppercase tracking-wider">
+ <th className="w-8 px-3 py-2 max-sm:px-2" />
+ <th className="text-left px-3 py-2 font-medium max-sm:px-1">{t('fileExplorer.name')}</th>
+ <th className="text-right px-3 py-2 font-medium w-28 hidden sm:table-cell">{t('fileExplorer.size')}</th>
+ {/* The date column is dropped in a mosaic (narrow panes). */}
+ <th className={clsx('text-left px-3 py-2 font-medium w-44 hidden', !inMosaic && 'sm:table-cell')}>{t('fileExplorer.modified')}</th>
+ <th className="text-right px-3 py-2 font-medium w-12 md:w-28 max-sm:px-1">
+ <span className="max-md:sr-only">{t('fileExplorer.actions')}</span>
+ </th>
+ </tr>
+ </thead>
+ <tbody>
+ {files.map((file, index) => {
+ const Icon = getFileIcon(file);
+ const isSelected = selectedFiles.has(file.path);
+ const isOperating = operationInProgress.has(file.path);
+ const isDeleting = deletingFile === file.path;
+ const isRenaming = renamingFile === file.path;
+ const isDropRow = dropRow === file.path;
+
+ return (
+ <tr
+ key={file.path}
+ data-index={index}
+ // Mouse: rows drag onto a folder or into another Files view (move).
+ draggable={!isCoarse && !isRenaming && !isDeleting && !isOperating && canRename}
+ onDragStart={(e) => handleRowDragStart(e, file)}
+ onDragEnd={handleRowDragEnd}
+ {...rowDropProps(file)}
+ onClick={(e) => {
+ if (isTouchEvent(e)) {
+ // Tap = open. stopPropagation also keeps the
+ // window 'click' listener from closing a menu
+ // this tap just opened.
+ e.stopPropagation();
+ openFile(file, { x: e.clientX, y: e.clientY });
+ } else {
+ toggleSelect(file.path, e);
+ }
+ }}
+ onDoubleClick={(e) => {
+ if (isTouchEvent(e)) return; // the tap already opened it
+ if (file.isDir) {
+ navigateTo(file);
+ } else if (isEditableText(file)) {
+ handleOpenEditor(file);
+ } else if (file.size <= MAX_UPLOAD_SIZE) {
+ handleDownload(file);
+ }
+ }}
+ onContextMenu={(e) => {
+ e.preventDefault();
+ e.stopPropagation();
+ setContextMenu({ x: e.clientX, y: e.clientY, file });
+ }}
+ className={`group /50 cursor-pointer transition-colors coarse:select-none coarse:[-webkit-touch-callout:none] ${
+ isDropRow
+ ? 'bg-accent/20 outline outline-1 -outline-offset-1 outline-accent/60'
+ : isSelected
+ ? 'bg-accent/10'
+ : 'hover:bg-bg-tertiary/50'
+ } ${isOperating ? 'opacity-50 pointer-events-none' : ''}`}
+ >
+ {/* Icon — on touch it also toggles the selection */}
+ <td
+ className="px-3 py-1.5 text-center max-sm:px-2"
+ onClick={(e) => {
+ if (!isTouchEvent(e)) return;
+ toggleSelect(file.path, e);
+ }}
+ >
+ {isOperating ? (
+ <Loader2 className="w-4 h-4 text-accent animate-spin mx-auto" />
+ ) : isSelected && isCoarse ? (
+ <CheckSquare className="w-4 h-4 mx-auto text-accent" aria-label={t('fileExplorer.selected')} />
+ ) : (
+ <Icon
+ className={`w-4 h-4 mx-auto ${
+ file.isDir ? 'text-yellow-500' : 'text-text-muted'
+ }`}
+ />
+ )}
+ </td>
+
+ {/* Name (+ size · date under it on phones) */}
+ <td className="px-3 py-1.5 max-sm:px-1 coarse:py-2.5">
+ {isRenaming ? (
+ <div className="flex items-center gap-1">
+ <input
+ ref={renameInputRef}
+ type="text"
+ value={renameValue}
+ onChange={(e) => setRenameValue(e.target.value)}
+ onKeyDown={(e) => {
+ if (e.key === 'Enter') confirmRename(file);
+ if (e.key === 'Escape') setRenamingFile(null);
+ }}
+ onClick={(e) => e.stopPropagation()}
+ onDoubleClick={(e) => e.stopPropagation()}
+ {...PLAIN_INPUT}
+ aria-label={t('fileExplorer.rename')}
+ className="px-1.5 py-0.5 text-sm bg-bg-tertiary border border-accent/50 rounded text-text-primary focus:outline-none w-full max-w-64 min-w-0"
+ autoFocus
+ />
+ <button
+ onClick={(e) => {
+ e.stopPropagation();
+ confirmRename(file);
+ }}
+ aria-label={t('fileExplorer.confirm')}
+ className={clsx('p-0.5 rounded text-green-400 hover:bg-green-400/10', TB)}
+ >
+ <Check className="w-3.5 h-3.5" />
+ </button>
+ <button
+ onClick={(e) => {
+ e.stopPropagation();
+ setRenamingFile(null);
+ }}
+ aria-label={t('fileExplorer.cancel')}
+ className={clsx('p-0.5 rounded text-red-400 hover:bg-red-400/10', TB)}
+ >
+ <X className="w-3.5 h-3.5" />
+ </button>
+ </div>
+ ) : (
+ <>
+ <span
+ className={`${
+ file.isDir
+ ? 'text-text-primary font-medium hover:text-accent'
+ : 'text-text-primary'
+ } transition-colors max-sm:[overflow-wrap:anywhere] ${inMosaic ? '[overflow-wrap:anywhere]' : ''}`}
+ // Mosaic: no date column, the date shows on hover.
+ title={inMosaic ? formatDate(file.modified) : undefined}
+ >
+ {file.name}
+ </span>
+ <div className="sm:hidden mt-0.5 text-[11px] text-text-muted tabular-nums">
+ {file.isDir ? formatDate(file.modified) : `${formatSize(file.size)} · ${formatDate(file.modified)}`}
+ </div>
+ {isRoot && isWindows && (
+ <DriveSpace totalBytes={file.totalBytes} freeBytes={file.freeBytes} label={file.label} fsType={file.fsType} />
+ )}
+ </>
+ )}
+ </td>
+
+ {/* Size */}
+ <td className="px-3 py-1.5 text-right text-text-muted text-xs tabular-nums hidden sm:table-cell">
+ {file.isDir ? '-' : formatSize(file.size)}
+ </td>
+
+ {/* Modified */}
+ <td className={clsx('px-3 py-1.5 text-text-muted text-xs hidden', !inMosaic && 'sm:table-cell')}>
+ {formatDate(file.modified)}
+ </td>
+
+ {/* Actions */}
+ <td className="px-3 py-1.5 text-right max-sm:px-1">
+ {isDeleting ? (
+ <div
+ className="inline-flex items-center gap-1"
+ onClick={(e) => e.stopPropagation()}
+ >
+ <span className="text-xs text-red-400 mr-1">
+ {t('fileExplorer.confirmDelete')}
+ </span>
+ <button
+ onClick={() => handleDelete(file)}
+ className={clsx('p-1 rounded text-red-400 hover:bg-red-400/10 transition-colors', TB)}
+ title={t('fileExplorer.confirm')}
+ aria-label={t('fileExplorer.confirm')}
+ >
+ <Check className="w-3.5 h-3.5" />
+ </button>
+ <button
+ onClick={() => setDeletingFile(null)}
+ className={clsx('p-1 rounded text-text-muted hover:bg-bg-tertiary transition-colors', TB)}
+ title={t('fileExplorer.cancel')}
+ aria-label={t('fileExplorer.cancel')}
+ >
+ <X className="w-3.5 h-3.5" />
+ </button>
+ </div>
+ ) : (
+ <>
+ {isRoot && isWindows && file.isDir && (
+ <AnalyzeButton path={file.path} device={device} onAnalyze={openUsage} compact />
+ )}
+ {/* md+: inline buttons — revealed on hover with a mouse,
+ always visible on touch screens. */}
+ <div className="hidden md:inline-flex items-center gap-0.5 can-hover:opacity-0 can-hover:group-hover:opacity-100 transition-opacity">
+ {!file.isDir && isEditableText(file) && canDownload && (
+ <button
+ onClick={(e) => {
+ e.stopPropagation();
+ handleOpenEditor(file);
+ }}
+ className={clsx('p-1 rounded text-text-muted hover:text-accent hover:bg-accent/10 transition-colors', TB)}
+ title={t('fileExplorer.edit', 'Edit')}
+ aria-label={t('fileExplorer.edit', 'Edit')}
+ >
+ <Edit3 className="w-3.5 h-3.5" />
+ </button>
+ )}
+ {!file.isDir && (
+ <button
+ onClick={(e) => {
+ e.stopPropagation();
+ handleDownload(file);
+ }}
+ disabled={!canDownload}
+ className={clsx('p-1 rounded text-text-muted hover:text-accent hover:bg-accent/10 disabled:opacity-30 disabled:cursor-not-allowed transition-colors', TB)}
+ title={canDownload ? t('fileExplorer.download') : unsupported}
+ aria-label={canDownload ? t('fileExplorer.download') : unsupported}
+ >
+ <Download className="w-3.5 h-3.5" />
+ </button>
+ )}
+ <button
+ onClick={(e) => {
+ e.stopPropagation();
+ requestRename(file);
+ }}
+ disabled={!canRename}
+ className={clsx('p-1 rounded text-text-muted hover:text-accent hover:bg-accent/10 disabled:opacity-30 disabled:cursor-not-allowed transition-colors', TB)}
+ title={canRename ? t('fileExplorer.rename') : unsupported}
+ aria-label={canRename ? t('fileExplorer.rename') : unsupported}
+ >
+ <Pencil className="w-3.5 h-3.5" />
+ </button>
+ <button
+ onClick={(e) => {
+ e.stopPropagation();
+ requestDelete(file);
+ }}
+ disabled={!canDelete}
+ className={clsx('p-1 rounded text-text-muted hover:text-red-400 hover:bg-red-400/10 disabled:opacity-30 disabled:cursor-not-allowed transition-colors', TB)}
+ title={canDelete ? t('fileExplorer.delete') : unsupported}
+ aria-label={canDelete ? t('fileExplorer.delete') : unsupported}
+ >
+ <Trash2 className="w-3.5 h-3.5" />
+ </button>
+ </div>
+ {/* Phones: every action in one "⋯" menu (bottom sheet). The
+ wrapper keeps the menu's clicks (portalled, but they
+ bubble through React) away from the row. Only mounted
+ below md. */}
+ {!isMd && (
+ <div
+ className="md:hidden inline-flex"
+ onClick={(e) => e.stopPropagation()}
+ onDoubleClick={(e) => e.stopPropagation()}
+ onContextMenu={(e) => e.stopPropagation()}
+ >
+ <ActionMenu
+ items={fileActions(file)}
+ label={t('fileExplorer.actions')}
+ sheetTitle={file.name}
+ />
+ </div>
+ )}
+ </>
+ )}
+ </td>
+ </tr>
+ );
+ })}
+ </tbody>
+ </table>
+ </div>
+ ) : (
+ !loading && (
+ <div className="flex flex-col items-center justify-center py-16 text-text-muted">
+ <FolderOpen className="w-10 h-10 mb-3 opacity-30" />
+ <p className="text-sm">{t('fileExplorer.empty')}</p>
+ {!isRoot && (
+ <p className="text-xs mt-1 opacity-60 coarse:hidden">{t('fileExplorer.dropToUpload')}</p>
+ )}
+ </div>
+ )
+ )}
+ </div>
+
+ {/* ── Status bar ───────────────────────────────────────────────────── */}
+ <div className="px-4 py-1.5 bg-bg-tertiary/50 flex items-center justify-between text-xs text-text-muted max-md:gap-3">
+ <span className="max-md:shrink-0">
+ {files.length > 0
+ ? `${files.length} ${t('fileExplorer.items')}${
+ selectedFiles.size > 0 ? ` — ${selectedFiles.size} ${t('fileExplorer.selected')}` : ''
+ }`
+ : ''}
+ </span>
+ <span className="opacity-60 max-md:min-w-0 max-md:truncate">{currentPath || (isWindows ? t('fileExplorer.drives') : '/')}</span>
+ </div>
+ </>)}
+ </div>
+
+ {/* ── Custom right-click context menu (long-press / tap on touch) ──── */}
+ {contextMenu && (() => {
+ const file = contextMenu.file;
+ const editable = !file.isDir && isEditableText(file);
+ const MENU_W = 200;
+ const MENU_H_EST = isCoarse ? 300 : 240;
+ const x = Math.max(8, Math.min(contextMenu.x, window.innerWidth - MENU_W - 8));
+ const y = Math.max(8, Math.min(contextMenu.y, window.innerHeight - MENU_H_EST - 8));
+ const close = () => setContextMenu(null);
+ const row = 'w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors text-left coarse:py-3 coarse:text-sm';
+ // Touch: a disabled item explains itself under its label (no hover title).
+ const why = (ok: boolean) => !ok && isCoarse && (
+ <span className="block text-[11px] text-text-muted">{unsupported}</span>
+ );
+ return (
+ <div
+ className="fixed z-[200] w-[200px] bg-bg-secondary rounded-lg shadow-2xl overflow-hidden py-1"
+ style={{ left: x, top: y }}
+ role="menu"
+ onClick={(e) => e.stopPropagation()}
+ onContextMenu={(e) => e.preventDefault()}
+ >
+ {file.isDir ? (
+ <button
+ role="menuitem"
+ onClick={() => { navigateTo(file); close(); }}
+ className={clsx(row, 'text-text-primary hover:bg-bg-tertiary')}
+ >
+ <FolderOpen className="w-3.5 h-3.5 text-yellow-500" />
+ {t('fileExplorer.open', 'Open')}
+ </button>
+ ) : null}
+ {file.isDir && usageAvail.offered && (
+ <button
+ role="menuitem"
+ onClick={() => { openUsage(file.path); close(); }}
+ disabled={!usageAvail.ok}
+ title={usageAvail.ok ? undefined : agentTooOldText(t)}
+ className={clsx(row, 'text-text-primary hover:bg-bg-tertiary disabled:opacity-30 disabled:cursor-not-allowed')}
+ >
+ <PieChart className="w-3.5 h-3.5 text-accent shrink-0" />
+ {t('fileExplorer.usage.analyze', 'Analyze disk usage')}
+ </button>
+ )}
+ {!file.isDir && (
+ <>
+ {editable && canDownload && (
+ <button
+ role="menuitem"
+ onClick={() => { handleOpenEditor(file); close(); }}
+ className={clsx(row, 'text-text-primary hover:bg-bg-tertiary')}
+ >
+ <Edit3 className="w-3.5 h-3.5 text-accent" />
+ {t('fileExplorer.edit', 'Edit')}
+ </button>
+ )}
+ <button
+ role="menuitem"
+ onClick={() => { handleDownload(file); close(); }}
+ disabled={!canDownload}
+ title={canDownload ? undefined : unsupported}
+ className={clsx(row, 'text-text-primary hover:bg-bg-tertiary disabled:opacity-30 disabled:cursor-not-allowed')}
+ >
+ <Download className="w-3.5 h-3.5 text-accent shrink-0" />
+ <span>{t('fileExplorer.download')}{why(canDownload)}</span>
+ </button>
+ </>
+ )}
+ <div className="h-px bg-border my-1" />
+ <button
+ role="menuitem"
+ onClick={() => { requestRename(file); close(); }}
+ disabled={!canRename}
+ title={canRename ? undefined : unsupported}
+ className={clsx(row, 'text-text-primary hover:bg-bg-tertiary disabled:opacity-30 disabled:cursor-not-allowed')}
+ >
+ <Pencil className="w-3.5 h-3.5 text-accent shrink-0" />
+ <span>{t('fileExplorer.rename')}{why(canRename)}</span>
+ </button>
+ <button
+ role="menuitem"
+ onClick={() => { requestDelete(file); close(); }}
+ disabled={!canDelete}
+ title={canDelete ? undefined : unsupported}
+ className={clsx(row, 'text-red-400 hover:bg-red-400/10 disabled:opacity-30 disabled:cursor-not-allowed')}
+ >
+ <Trash2 className="w-3.5 h-3.5 shrink-0" />
+ <span>{t('fileExplorer.delete')}{why(canDelete)}</span>
+ </button>
+ </div>
+ );
+ })()}
+
+ {/* ── Text editor: side panel from lg up ───────────────────────────── */}
+ {editorFile && !editorAsSheet && (
+ <div className="w-1/2 min-w-[400px] bg-bg-secondary rounded-xl overflow-hidden flex flex-col">
+ {/* Header */}
+ <div className="px-4 py-3 flex items-center gap-2">
+ <Edit3 className="w-4 h-4 text-accent shrink-0" />
+ <div className="flex-1 min-w-0">
+ <div className="text-sm text-text-primary font-medium truncate">{editorFile.name}</div>
+ <div className="text-xs text-text-muted truncate" title={editorFile.path}>{editorFile.path}</div>
+ </div>
+ {unsavedBadge}
+ {saveButton}
+ <button
+ onClick={handleCloseEditor}
+ disabled={editorSaving}
+ className={clsx('p-1.5 rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-tertiary transition-colors', TB)}
+ title={t('fileExplorer.close', 'Close')}
+ aria-label={t('fileExplorer.close', 'Close')}
+ >
+ <X className="w-4 h-4" />
+ </button>
+ </div>
+
+ {/* Editor area */}
+ {renderEditorArea('w-full h-full min-h-[400px] p-4 bg-bg-primary text-text-primary font-mono text-xs leading-relaxed resize-none focus:outline-none')}
+
+ {/* Footer with info */}
+ <div className="px-4 py-1.5 bg-bg-tertiary/50 flex items-center justify-between text-xs text-text-muted">
+ {editorStats}
+ </div>
+ </div>
+ )}
+
+ {/* ── Text editor: full-screen sheet below lg ──────────────────────── */}
+ <Modal
+ open={editorAsSheet}
+ onClose={handleCloseEditor}
+ size="full"
+ closeOnBackdrop={false}
+ dismissible={!editorSaving}
+ title={editorFile?.name}
+ icon={<Edit3 className="w-4 h-4 text-accent shrink-0" />}
+ headerExtra={<>{unsavedBadge}{saveButton}</>}
+ bodyClassName="p-0 flex flex-col"
+ footer={<div className="flex w-full items-center justify-between gap-3">{editorStats}</div>}
+ footerClassName="py-1.5 bg-bg-tertiary/50 text-xs text-text-muted"
+ >
+ <div className="px-4 pb-2 text-xs text-text-muted truncate">{editorFile?.path}</div>
+ {renderEditorArea('w-full h-full min-h-[12rem] p-3 bg-bg-primary text-text-primary font-mono text-xs leading-relaxed resize-none focus:outline-none')}
+ </Modal>
+ </div>
+ );
+}
